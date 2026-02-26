@@ -800,21 +800,264 @@ def extract_coverage_samsung_table(pdf_path):
 
 
 # ══════════════════════════════════════════════
-# 메인 분기 + 범용 파서
+# 통합 파싱 (PDF 1회 오픈) + 메인 분기 + 범용 파서
 # ══════════════════════════════════════════════
 
+def parse_pdf_all_in_one(pdf_path):
+    """PDF를 1번만 열어서 보험사/상품명/보험료/특약 모두 추출 (최적화 버전)"""
+    # 1단계: PDF를 1번만 열어서 필요한 텍스트 추출
+    with pdfplumber.open(pdf_path) as pdf:
+        total_pages = len(pdf.pages)
+        # 처음 7페이지만 텍스트 추출 (대부분의 정보가 여기에 있음)
+        max_pages = min(total_pages, 10)
+        page_texts = []
+        for i in range(max_pages):
+            text = pdf.pages[i].extract_text()
+            page_texts.append(text or "")
+
+    # 2단계: 보험사 감지 (텍스트 재사용)
+    combined_3 = "\n".join(page_texts[:3])
+    insurer_code = _detect_insurer_from_text(combined_3)
+
+    # 3단계: 상품명 추출 (텍스트 재사용)
+    product_name = _detect_product_name_from_text(page_texts[:3])
+
+    # 4단계: 보험료 추출 (텍스트 재사용)
+    premium = _extract_premium_from_texts(page_texts[:7])
+
+    # 5단계: 특약 추출 (보험사별 분기, 필요시 PDF 재오픈)
+    if insurer_code == "samsung_life":
+        coverages = _extract_coverage_samsung_from_texts(page_texts, pdf_path)
+    elif insurer_code == "mirae":
+        coverages = extract_coverage_mirae(pdf_path)
+    elif insurer_code == "kb":
+        coverages = _extract_coverage_kb_from_texts(page_texts, pdf_path)
+    else:
+        coverages = extract_coverage_generic(pdf_path)
+
+    insurer_name_map = {
+        "meritz": "메리츠화재", "samsung": "삼성화재",
+        "samsung_life": "삼성생명", "kb": "KB손해보험",
+        "db": "DB손해보험", "mirae": "미래에셋생명",
+        "abl": "ABL생명", "heungkuk": "흥국생명",
+        "hanwha": "한화생명", "hyundai": "현대해상",
+        "lotte": "롯데손해보험", "nh": "NH농협생명",
+        "dongyang": "동양생명", "kyobo": "교보생명",
+        "shinhan": "신한라이프",
+    }
+
+    return {
+        "insurer_code": insurer_code,
+        "insurer_name": insurer_name_map.get(insurer_code, insurer_code or "알 수 없음"),
+        "product_name": product_name,
+        "premium": premium,
+        "coverages": coverages,
+    }
+
+
+def _detect_insurer_from_text(text):
+    """이미 추출된 텍스트에서 보험사 감지"""
+    keywords_ordered = [
+        ("삼성생명", "samsung_life"),
+        ("삼성화재", "samsung"),
+        ("메리츠화재", "meritz"),
+        ("메리츠", "meritz"),
+        ("미래에셋생명", "mirae"),
+        ("미래에셋", "mirae"),
+        ("KB손해", "kb"), ("KB손보", "kb"),
+        ("KB 플러스", "kb"), ("KB플러스", "kb"),
+        ("DB손해", "db"), ("DB손보", "db"),
+        ("ABL", "abl"), ("에이비엘", "abl"),
+        ("흥국", "heungkuk"), ("한화", "hanwha"),
+        ("현대해상", "hyundai"), ("롯데손해", "lotte"),
+        ("NH농협", "nh"), ("동양생명", "dongyang"),
+        ("교보생명", "kyobo"), ("신한라이프", "shinhan"),
+    ]
+    for keyword, insurer in keywords_ordered:
+        if keyword in text:
+            return insurer
+    if "kbinsure" in text.lower():
+        return "kb"
+    if "삼성" in text:
+        if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
+            return "samsung_life"
+        return "samsung"
+    return None
+
+
+def _detect_product_name_from_text(page_texts):
+    """이미 추출된 페이지 텍스트에서 상품명 추출"""
+    for text in page_texts:
+        if not text:
+            continue
+        for line in text.split('\n'):
+            line = line.strip()
+
+            kb_match = re.search(r'(KB\s*플러스\s*[^\(\n]+보험)', line)
+            if kb_match:
+                name = kb_match.group(1).strip()
+                name = re.sub(r'\(무배당\).*', '', name).strip()
+                return name[:30] if len(name) > 30 else name
+
+            kb_match2 = re.search(r'(KB\s*[^\(\n]*보험[^\(\n]*)\(무배당\)', line)
+            if kb_match2:
+                name = kb_match2.group(1).strip()
+                return name[:30] if len(name) > 30 else name
+
+            mirae_match = re.search(r'(M-케어\s*건강[^\(]*)', line)
+            if mirae_match:
+                name = mirae_match.group(1).strip()
+                return name[:30] if len(name) > 30 else name
+
+            if re.match(r'^\(무\)|^\(유\)', line):
+                name = re.sub(r'^\(무\)\s*|^\(유\)\s*', '', line)
+                match = re.match(r'^([^(]+)', name)
+                if match:
+                    name = match.group(1).strip()
+                return name[:30] if len(name) > 30 else name
+
+            samsung_match = re.match(r'^삼성\s+(.+보험)', line)
+            if samsung_match:
+                name = samsung_match.group(1).strip()
+                name = re.sub(r'\(\d{4}\).*', '', name).strip()
+                return name[:30] if len(name) > 30 else name
+
+            meritz_match = re.search(r'(메리츠\s*[^\(\n]*보험[^\(\n]*)', line)
+            if meritz_match:
+                name = meritz_match.group(1).strip()
+                name = re.sub(r'\(무배당\).*', '', name).strip()
+                return name[:30] if len(name) > 30 else name
+
+    return "상품명 미확인"
+
+
+def _extract_premium_from_texts(page_texts):
+    """이미 추출된 페이지 텍스트에서 보험료 추출"""
+    patterns = [
+        r'실납입보험료\s*([\d,]+)\s*원',
+        r'1회차보험료\(할인후\)\s*([\d,]+)\s*원',
+        r'할인후초회보험료\s*([\d,]+)\s*원',
+        r'보장보험료\s*합계\s*([\d,]+)\s*원',
+        r'합\s*계\s*보\s*험\s*료\s*([\d,]+)\s*원',
+        r'합계보험료\s*([\d,]+)\s*원',
+        r'합\s*계\s*([\d,]+)',
+        r'보험료\s*[:\s]?\s*([\d,]+)\s*원',
+    ]
+    for text in page_texts:
+        if not text:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                val = int(match.group(1).replace(',', ''))
+                if val >= 1000:
+                    return val
+    return None
+
+
+def _extract_coverage_samsung_from_texts(page_texts, pdf_path):
+    """삼성생명 - 미리 추출된 텍스트로 특약 파싱 (페이지 제한)"""
+    results = []
+    # 5~8페이지에 특약 정보가 집중 (인덱스 4~7)
+    relevant_texts = page_texts[4:8] if len(page_texts) > 4 else page_texts
+    full_text = "\n".join(relevant_texts)
+
+    lines = full_text.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line:
+            continue
+
+        match = re.match(
+            r'^(\d{1,4})\s+(.+?)\s+(\d[\d,]*(?:억|천만|백만|만|천)?원)\s+(\d+년갱신)',
+            line
+        )
+        if match:
+            name = match.group(2).strip()
+            amount_text = match.group(3).strip()
+            amount = parse_amount(amount_text)
+            if name and amount and len(name) >= 5:
+                name_nospace = name.replace(" ", "")
+                if not any(sk in name_nospace for sk in ["합계보험료", "주보험"]):
+                    if not any(r["특약명"] == name for r in results):
+                        results.append({"특약명": name, "가입금액": amount})
+            continue
+
+        match_name = re.match(r'^(\d{1,4})\s+(.+)', line)
+        if match_name:
+            name_part = match_name.group(2).strip()
+            if any(kw in name_part for kw in [
+                "보장특약", "수술", "진단", "사망", "무배당",
+                "양성신생물", "파워수술", "질병", "재해", "여성특정"
+            ]):
+                amount_in_line = re.search(r'(\d[\d,]*(?:억|천만|백만|만|천)?원)', name_part)
+                if amount_in_line:
+                    amount = parse_amount(amount_in_line.group(1))
+                    name = name_part[:amount_in_line.start()].strip()
+                    if name and amount and len(name) >= 5:
+                        if not any(r["특약명"] == name for r in results):
+                            results.append({"특약명": name, "가입금액": amount})
+                    continue
+
+                for look_ahead in range(i, min(i + 3, len(lines))):
+                    next_line = lines[look_ahead].strip()
+                    amount_match = re.match(r'^(\d[\d,]*(?:억|천만|백만|만|천)?원)', next_line)
+                    if amount_match:
+                        amount = parse_amount(amount_match.group(1))
+                        if name_part and amount and len(name_part) >= 5:
+                            if not any(r["특약명"] == name_part for r in results):
+                                results.append({"특약명": name_part, "가입금액": amount})
+                        break
+                continue
+
+        if "재해사망" in line and "보험금" in line:
+            amount_match = re.search(r'(\d[\d,]*(?:억|천만|백만|만|천)?원)', line)
+            if amount_match:
+                amount = parse_amount(amount_match.group(1))
+                if amount and not any(r["특약명"] == "주보험 재해사망" for r in results):
+                    results.append({"특약명": "주보험 재해사망", "가입금액": amount})
+            continue
+
+    # 텍스트 기반으로 결과 없으면 테이블 파싱 시도 (원본 함수 사용)
+    if not results:
+        results = extract_coverage_samsung_table(pdf_path)
+
+    return results
+
+
+def _extract_coverage_kb_from_texts(page_texts, pdf_path):
+    """KB손해보험 - 미리 추출된 텍스트로 특약 파싱"""
+    results = []
+    full_text = "\n".join(page_texts)
+
+    for page_text in page_texts[:10]:
+        if not page_text:
+            continue
+        is_coverage_page = any(kw in page_text for kw in [
+            "가입담보", "가입내용", "보장명", "가입금액"
+        ])
+        if not is_coverage_page:
+            continue
+        _parse_kb_coverage_page(page_text, results)
+
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r["특약명"] not in seen:
+            seen.add(r["특약명"])
+            unique_results.append(r)
+    results = unique_results
+
+    _enrich_kb_injury_grade_info(results, full_text)
+    return results
+
+
 def extract_coverage_from_pdf(pdf_path):
-    """PDF에서 특약명 + 가입금액 추출 (보험사별 분기)"""
-    insurer = detect_insurer(pdf_path)
-
-    if insurer == "samsung_life":
-        return extract_coverage_samsung(pdf_path)
-    elif insurer == "mirae":
-        return extract_coverage_mirae(pdf_path)
-    elif insurer == "kb":
-        return extract_coverage_kb(pdf_path)
-
-    return extract_coverage_generic(pdf_path)
+    """PDF에서 특약명 + 가입금액 추출 (보험사별 분기) — 레거시 호환"""
+    result = parse_pdf_all_in_one(pdf_path)
+    return result["coverages"]
 
 
 def extract_coverage_generic(pdf_path):

@@ -10,7 +10,8 @@ from typing import List, Optional
 
 from pdf_parser import (
     extract_coverage_from_pdf, detect_insurer,
-    detect_product_name, extract_premium
+    detect_product_name, extract_premium,
+    parse_pdf_all_in_one
 )
 from excel_handler import (
     read_excel_coverages, write_matched_amounts,
@@ -133,12 +134,13 @@ async def match_with_summary(
                 tmp_path = tmp.name
                 tmp_pdf_paths.append(tmp_path)
 
-            # PDF 파싱
-            insurer_code = detect_insurer(tmp_path)
-            insurer_display = INSURER_NAMES.get(insurer_code, insurer_code or "알 수 없음")
-            product_name = detect_product_name(tmp_path)
-            premium = extract_premium(tmp_path)
-            pdf_coverages = extract_coverage_from_pdf(tmp_path)
+            # PDF 파싱 (통합 1회 오픈)
+            pdf_info = parse_pdf_all_in_one(tmp_path)
+            insurer_code = pdf_info["insurer_code"]
+            insurer_display = pdf_info["insurer_name"]
+            product_name = pdf_info["product_name"]
+            premium = pdf_info["premium"]
+            pdf_coverages = pdf_info["coverages"]
 
             # Excel에서 특약명 읽기
             excel_coverages = read_excel_coverages(
@@ -248,10 +250,11 @@ async def match_and_download(
                 tmp_path = tmp.name
                 tmp_pdf_paths.append(tmp_path)
 
-            insurer_code = detect_insurer(tmp_path)
-            insurer_display = INSURER_NAMES.get(insurer_code, insurer_code or "알 수 없음")
-            product_name = detect_product_name(tmp_path)
-            premium = extract_premium(tmp_path)
+            # PDF 파싱 (통합 1회 오픈)
+            pdf_info = parse_pdf_all_in_one(tmp_path)
+            insurer_display = pdf_info["insurer_name"]
+            product_name = pdf_info["product_name"]
+            premium = pdf_info["premium"]
 
             # 보험사명, 상품명 기록
             write_insurer_info(
@@ -270,7 +273,7 @@ async def match_and_download(
                 )
 
             # 특약 추출 및 매칭
-            pdf_coverages = extract_coverage_from_pdf(tmp_path)
+            pdf_coverages = pdf_info["coverages"]
             excel_coverages = read_excel_coverages(
                 output_path, sn, 2, current_amount_col, start_row
             )
