@@ -1,6 +1,13 @@
 import pdfplumber
 import re
 
+# PyMuPDF — 텍스트 추출 전용 (pdfplumber 대비 50배+ 빠름)
+try:
+    import fitz as _fitz
+    HAS_PYMUPDF = True
+except ImportError:
+    HAS_PYMUPDF = False
+
 
 def detect_insurer(pdf_path):
     """PDF에서 보험사 자동 감지"""
@@ -804,56 +811,134 @@ def extract_coverage_samsung_table(pdf_path):
 # ══════════════════════════════════════════════
 
 def parse_pdf_all_in_one(pdf_path):
-    """PDF를 1번만 열어서 보험사/상품명/보험료/특약 모두 추출 (최적화 버전)"""
-    # 1단계: PDF를 1번만 열어서 텍스트 추출 + 키워드 있는 페이지만 테이블 추출
+    """PDF를 최적화하여 파싱 (하이브리드: PyMuPDF 텍스트감지 + pdfplumber 테이블)
+    
+    전략:
+    1. PyMuPDF로 전체 텍스트를 0.2초에 추출 (키워드 페이지 식별 + 보험사/상품명/보험료 감지)
+    2. pdfplumber는 키워드 페이지만 열어서 테이블 추출 (비-키워드 페이지 완전 스킵)
+    3. 텍스트 기반 파서(삼성생명, KB)에 필요한 페이지만 pdfplumber 텍스트 추출
+    """
     coverage_keywords = [
         '특약', '담보', '가입금액', '보장내용',
         '보장내역', '가입담보', '보장항목'
     ]
-    page_texts = []
-    page_tables = {}  # {page_index: tables} — 키워드 있는 페이지만
+    page_texts_fast = []     # PyMuPDF 텍스트 (빠른 감지용)
+    page_texts = []          # pdfplumber 텍스트 (파서 호환용, 필요 페이지만)
+    page_tables = {}         # {page_index: tables}
 
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            page_texts.append(text or "")
+    # ── 1단계: PyMuPDF로 빠른 전체 텍스트 추출 (0.2초) ──
+    if HAS_PYMUPDF:
+        doc = _fitz.open(pdf_path)
+        for page in doc:
+            page_texts_fast.append(page.get_text() or "")
+        doc.close()
 
-            # 키워드가 있는 페이지만 테이블 추출 (비용이 큰 작업)
+        # 키워드 페이지 식별
+        keyword_page_set = set()
+        for i, text in enumerate(page_texts_fast):
             if text and any(kw in text for kw in coverage_keywords):
-                tables = page.extract_tables({
-                    'vertical_strategy': 'lines',
-                    'horizontal_strategy': 'lines',
-                    'snap_tolerance': 5,
-                    'join_tolerance': 5,
-                })
-                if not tables:
+                keyword_page_set.add(i)
+
+        # 보험사 감지 (PyMuPDF 텍스트로)
+        combined_3 = "\n".join(page_texts_fast[:3])
+        insurer_code = _detect_insurer_from_text(combined_3)
+
+        # 상품명 추출 (PyMuPDF 텍스트로 — 줄 분리가 달라도 정규식 동작)
+        product_name = _detect_product_name_from_text(page_texts_fast[:3])
+
+        # 보험료 추출 (PyMuPDF 텍스트로)
+        premium = _extract_premium_from_texts(page_texts_fast[:7])
+
+        # 보험사별로 pdfplumber에서 필요한 페이지 결정
+        # 텍스트 기반 파서는 pdfplumber 텍스트 필요, 테이블 기반은 키워드 페이지 테이블만
+        needs_pdfplumber_text = set()
+        if insurer_code == "samsung_life":
+            # 삼성생명: 페이지 4~7 (인덱스 기준) 텍스트 필요
+            for pg in range(4, min(8, len(page_texts_fast))):
+                needs_pdfplumber_text.add(pg)
+        elif insurer_code == "kb":
+            # KB: 처음 10페이지 텍스트 필요
+            for pg in range(min(10, len(page_texts_fast))):
+                needs_pdfplumber_text.add(pg)
+        elif insurer_code == "mirae":
+            # 미래에셋: 별도 함수에서 PDF를 다시 열므로 여기선 불필요
+            pass
+        # 범용(메리츠 등): 테이블만 필요 → pdfplumber 텍스트 불필요
+
+        # pdfplumber 열기 — 필요한 페이지만 처리
+        pages_to_process = keyword_page_set | needs_pdfplumber_text
+        if pages_to_process:
+            with pdfplumber.open(pdf_path) as pdf:
+                # page_texts를 전체 길이로 초기화 (빈 문자열)
+                page_texts = [""] * len(pdf.pages)
+                for i in sorted(pages_to_process):
+                    if i >= len(pdf.pages):
+                        continue
+                    page = pdf.pages[i]
+
+                    # 텍스트 추출 (텍스트 기반 파서에 필요한 페이지만)
+                    if i in needs_pdfplumber_text:
+                        text = page.extract_text()
+                        page_texts[i] = text or ""
+
+                    # 테이블 추출 (키워드 페이지만)
+                    if i in keyword_page_set:
+                        tables = page.extract_tables({
+                            'vertical_strategy': 'lines',
+                            'horizontal_strategy': 'lines',
+                            'snap_tolerance': 5,
+                            'join_tolerance': 5,
+                        })
+                        if not tables:
+                            tables = page.extract_tables({
+                                'vertical_strategy': 'text',
+                                'horizontal_strategy': 'text',
+                            })
+                        if tables:
+                            page_tables[i] = tables
+        else:
+            page_texts = [""] * len(page_texts_fast)
+
+    else:
+        # PyMuPDF 없으면 기존 pdfplumber 전체 처리
+        keyword_page_set = set()
+        with pdfplumber.open(pdf_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                page_texts.append(text or "")
+                if text and any(kw in text for kw in coverage_keywords):
+                    keyword_page_set.add(i)
                     tables = page.extract_tables({
-                        'vertical_strategy': 'text',
-                        'horizontal_strategy': 'text',
+                        'vertical_strategy': 'lines',
+                        'horizontal_strategy': 'lines',
+                        'snap_tolerance': 5,
+                        'join_tolerance': 5,
                     })
-                if tables:
-                    page_tables[i] = tables
+                    if not tables:
+                        tables = page.extract_tables({
+                            'vertical_strategy': 'text',
+                            'horizontal_strategy': 'text',
+                        })
+                    if tables:
+                        page_tables[i] = tables
 
-    # 2단계: 보험사 감지 (텍스트 재사용)
-    combined_3 = "\n".join(page_texts[:3])
-    insurer_code = _detect_insurer_from_text(combined_3)
+        combined_3 = "\n".join(page_texts[:3])
+        insurer_code = _detect_insurer_from_text(combined_3)
+        product_name = _detect_product_name_from_text(page_texts[:3])
+        premium = _extract_premium_from_texts(page_texts[:7])
 
-    # 3단계: 상품명 추출 (텍스트 재사용)
-    product_name = _detect_product_name_from_text(page_texts[:3])
-
-    # 4단계: 보험료 추출 (텍스트 재사용)
-    premium = _extract_premium_from_texts(page_texts[:7])
-
-    # 5단계: 특약 추출 (보험사별 분기)
+    # ── 특약 추출 (보험사별 분기) ──
     if insurer_code == "samsung_life":
         coverages = _extract_coverage_samsung_from_texts(page_texts, pdf_path)
     elif insurer_code == "mirae":
         coverages = extract_coverage_mirae(pdf_path)
     elif insurer_code == "kb":
-        coverages = _extract_coverage_kb_from_texts(page_texts, pdf_path)
+        coverages = _extract_coverage_kb_from_texts(
+            # KB 파서는 page_texts 리스트 필요 — pdfplumber 텍스트 사용
+            page_texts if any(page_texts) else page_texts_fast, pdf_path
+        )
     else:
-        # 범용 파서 — 미리 추출한 텍스트+테이블 재사용 (PDF 재오픈 안 함)
+        # 범용 파서 — 테이블 캐시 사용 (PDF 재오픈 안 함)
         coverages = _extract_coverage_generic_from_cache(page_texts, page_tables, pdf_path)
 
     insurer_name_map = {

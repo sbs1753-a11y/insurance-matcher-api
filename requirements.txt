@@ -1,6 +1,7 @@
 fastapi[standard]
 uvicorn[standard]
 pdfplumber
+PyMuPDF
 openpyxl
 rapidfuzz
 python-multipart
