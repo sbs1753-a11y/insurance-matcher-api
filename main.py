@@ -2,9 +2,10 @@ import os
 import tempfile
 import shutil
 import traceback
+from urllib.parse import quote
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from typing import List, Optional
 
 from pdf_parser import (
@@ -291,12 +292,23 @@ async def match_and_download(
         if customer_name:
             filename = f"{customer_name}_보장분석표.xlsx"
 
-        return FileResponse(
-            path=output_path,
-            filename=filename,
+        # 한글 파일명 인코딩 (RFC 5987)
+        encoded_filename = quote(filename)
+
+        def file_iterator(path):
+            with open(path, "rb") as f:
+                while chunk := f.read(65536):
+                    yield chunk
+            # 스트리밍 완료 후 임시파일 삭제
+            if os.path.exists(path):
+                os.unlink(path)
+
+        return StreamingResponse(
+            file_iterator(output_path),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.document",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+                "Access-Control-Expose-Headers": "Content-Disposition",
             }
         )
 
@@ -314,7 +326,7 @@ async def match_and_download(
         for p in tmp_pdf_paths:
             if os.path.exists(p):
                 os.unlink(p)
-        # Note: output_path cleanup for FileResponse is handled by FastAPI
+        # Note: output_path is cleaned up inside file_iterator after streaming
 
 
 if __name__ == "__main__":
