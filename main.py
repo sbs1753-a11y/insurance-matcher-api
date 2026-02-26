@@ -8,11 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from typing import List, Optional
 
-from pdf_parser import (
-    extract_coverage_from_pdf, detect_insurer,
-    detect_product_name, extract_premium,
-    parse_pdf_all_in_one
-)
+from pdf_parser import parse_pdf_all_in_one
 from excel_handler import (
     read_excel_coverages, write_matched_amounts,
     write_insurer_info, write_premium, find_structure
@@ -60,7 +56,7 @@ async def health():
 
 @app.post("/api/parse-pdf")
 async def parse_pdf(pdf_file: UploadFile = File(...)):
-    """단일 PDF 파싱 — 보험사, 상품명, 보험료, 특약 목록 반환"""
+    """단일 PDF 파싱 — 보험사, 상품명, 보험료, 특약 목록 반환 (최적화: 1회 오픈)"""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -68,21 +64,18 @@ async def parse_pdf(pdf_file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
 
-        insurer_code = detect_insurer(tmp_path)
-        insurer_name = INSURER_NAMES.get(insurer_code, insurer_code or "알 수 없음")
-        product_name = detect_product_name(tmp_path)
-        premium = extract_premium(tmp_path)
-        coverages = extract_coverage_from_pdf(tmp_path)
+        # 최적화: parse_pdf_all_in_one으로 PDF를 1회만 열어서 전체 정보 추출
+        pdf_info = parse_pdf_all_in_one(tmp_path)
 
         return {
             "success": True,
             "filename": pdf_file.filename,
-            "insurer_code": insurer_code,
-            "insurer_name": insurer_name,
-            "product_name": product_name,
-            "premium": premium,
-            "coverages": coverages,
-            "coverage_count": len(coverages),
+            "insurer_code": pdf_info["insurer_code"],
+            "insurer_name": pdf_info["insurer_name"],
+            "product_name": pdf_info["product_name"],
+            "premium": pdf_info["premium"],
+            "coverages": pdf_info["coverages"],
+            "coverage_count": len(pdf_info["coverages"]),
         }
     except Exception as e:
         return JSONResponse(

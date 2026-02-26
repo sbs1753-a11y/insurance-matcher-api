@@ -805,15 +805,35 @@ def extract_coverage_samsung_table(pdf_path):
 
 def parse_pdf_all_in_one(pdf_path):
     """PDF를 1번만 열어서 보험사/상품명/보험료/특약 모두 추출 (최적화 버전)"""
-    # 1단계: PDF를 1번만 열어서 필요한 텍스트 추출
+    # 1단계: PDF를 1번만 열어서 텍스트 추출 + 키워드 있는 페이지만 테이블 추출
+    coverage_keywords = [
+        '특약', '담보', '가입금액', '보장내용',
+        '보장내역', '가입담보', '보장항목'
+    ]
+    page_texts = []
+    page_tables = {}  # {page_index: tables} — 키워드 있는 페이지만
+
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
-        # 처음 7페이지만 텍스트 추출 (대부분의 정보가 여기에 있음)
-        max_pages = min(total_pages, 10)
-        page_texts = []
-        for i in range(max_pages):
-            text = pdf.pages[i].extract_text()
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text()
             page_texts.append(text or "")
+
+            # 키워드가 있는 페이지만 테이블 추출 (비용이 큰 작업)
+            if text and any(kw in text for kw in coverage_keywords):
+                tables = page.extract_tables({
+                    'vertical_strategy': 'lines',
+                    'horizontal_strategy': 'lines',
+                    'snap_tolerance': 5,
+                    'join_tolerance': 5,
+                })
+                if not tables:
+                    tables = page.extract_tables({
+                        'vertical_strategy': 'text',
+                        'horizontal_strategy': 'text',
+                    })
+                if tables:
+                    page_tables[i] = tables
 
     # 2단계: 보험사 감지 (텍스트 재사용)
     combined_3 = "\n".join(page_texts[:3])
@@ -825,7 +845,7 @@ def parse_pdf_all_in_one(pdf_path):
     # 4단계: 보험료 추출 (텍스트 재사용)
     premium = _extract_premium_from_texts(page_texts[:7])
 
-    # 5단계: 특약 추출 (보험사별 분기, 필요시 PDF 재오픈)
+    # 5단계: 특약 추출 (보험사별 분기)
     if insurer_code == "samsung_life":
         coverages = _extract_coverage_samsung_from_texts(page_texts, pdf_path)
     elif insurer_code == "mirae":
@@ -833,7 +853,8 @@ def parse_pdf_all_in_one(pdf_path):
     elif insurer_code == "kb":
         coverages = _extract_coverage_kb_from_texts(page_texts, pdf_path)
     else:
-        coverages = extract_coverage_generic(pdf_path)
+        # 범용 파서 — 미리 추출한 텍스트+테이블 재사용 (PDF 재오픈 안 함)
+        coverages = _extract_coverage_generic_from_cache(page_texts, page_tables, pdf_path)
 
     insurer_name_map = {
         "meritz": "메리츠화재", "samsung": "삼성화재",
@@ -1058,6 +1079,109 @@ def extract_coverage_from_pdf(pdf_path):
     """PDF에서 특약명 + 가입금액 추출 (보험사별 분기) — 레거시 호환"""
     result = parse_pdf_all_in_one(pdf_path)
     return result["coverages"]
+
+
+def _extract_coverage_generic_from_cache(page_texts, page_tables, pdf_path):
+    """범용 파서 — 미리 추출된 텍스트+테이블 캐시 사용 (PDF 재오픈 없음)"""
+    results = []
+    sub_prefix_pattern = re.compile(r'^┗?\s*\d+\s+')
+
+    header_keywords = [
+        "가입담보", "가입담보및보장내용", "담보명", "특약명",
+        "보장명", "담보내용", "보장항목", "보장내용",
+        "급부명", "보장담보", "보험종목", "보장종목"
+    ]
+    amount_keywords = ["가입금액", "보험가입금액", "보장금액"]
+
+    for page_idx, tables in page_tables.items():
+        for table in tables:
+            if not table or len(table) < 2:
+                continue
+
+            header_idx = None
+            amount_col = None
+
+            for idx, row in enumerate(table):
+                if idx > 5:
+                    break
+                for j, cell in enumerate(row):
+                    if not cell:
+                        continue
+                    cell_clean = cell.replace(" ", "").replace("\n", "")
+                    if any(kw in cell_clean for kw in header_keywords):
+                        header_idx = idx
+                    if any(kw in cell_clean for kw in amount_keywords):
+                        amount_col = j
+                if header_idx is not None:
+                    break
+
+            if header_idx is None or amount_col is None:
+                continue
+
+            name_col = find_name_col_from_data(table, header_idx)
+            if name_col is None:
+                continue
+
+            for row in table[header_idx + 1:]:
+                if not row or len(row) <= max(name_col, amount_col):
+                    continue
+
+                name = row[name_col]
+                if not name:
+                    continue
+
+                name = name.replace("\n", " ")
+                name = re.sub(r'\s+', ' ', name).strip()
+
+                if len(name) < 5:
+                    continue
+
+                skip_names = [
+                    "주계약", "선택특약", "필수특약", "의무특약",
+                    "합계", "총보험료", "보장보험료", "보험료합계",
+                    "2회차이후", "1회차보험료", "계약자명",
+                    "보장보험료합계", "적립보험료", "할인보험료",
+                    "선택계약", "보험료사항",
+                    "보험료자동납입", "주의사항"
+                ]
+                name_nospace = name.replace(" ", "")
+
+                if name_nospace == "기본계약":
+                    continue
+                if any(sk in name_nospace for sk in skip_names):
+                    continue
+                if re.match(r'^[\d,.\s%원]+$', name):
+                    continue
+                if re.match(r'^\d+년\s*\(\d+세\)', name_nospace):
+                    continue
+                if "경우" in name and "지급" in name:
+                    continue
+                if len(name) > 100 and ("보험기간" in name or "최초계약" in name):
+                    continue
+
+                name = sub_prefix_pattern.sub('', name).strip()
+                name = re.sub(r'\(필수\)|\(선택\)', '', name).strip()
+
+                if len(name) < 5:
+                    continue
+
+                amount = None
+                if len(row) > amount_col and row[amount_col]:
+                    amount = parse_amount(row[amount_col])
+
+                if amount is None:
+                    for cell in row:
+                        if cell and cell != name:
+                            parsed = parse_amount(cell)
+                            if parsed:
+                                amount = parsed
+                                break
+
+                if name and amount:
+                    if not any(r["특약명"] == name for r in results):
+                        results.append({"특약명": name, "가입금액": amount})
+
+    return results
 
 
 def extract_coverage_generic(pdf_path):
