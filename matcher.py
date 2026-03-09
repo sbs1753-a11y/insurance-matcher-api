@@ -81,46 +81,71 @@ def simplify_excel_name(name):
 
 
 def get_surgery_grade_amounts(pdf_coverages):
-    """1종~7종 수술비의 상해/질병별 금액을 모두 수집하고 각 종별 최소값 반환
+    """1종~7종 수술비의 상해/질병별 금액을 모두 수집하고 각 종별 합산 반환
     
-    질병/상해 양쪽에 종별 수술이 있으면 min(질병, 상해)를 표시.
-    흥국생명: '[재해]X종수술' (보장내용에서 추출된 종별 재해수술)도 인식.
+    규칙:
+    1) 질병/상해(재해) 양쪽에 같은 종별 수술이 있으면 min(질병, 상해) 사용
+       (흥국생명: 질병수술1종 + 재해수술1종 → min)
+    2) 서로 다른 라이더 그룹(1-5종수술 vs 1-7종수술)이 있으면 sum
+       (미래에셋: 1-5종수술(1종) 20만 + [1-7종]1종 10만 → 30만)
     """
-    grade_amounts = {i: [] for i in range(1, 8)}
+    # {grade: {"base": [amounts], "extra": [amounts]}}
+    # base = 1-5종수술/질병수술/재해수술 등 (min 적용)
+    # extra = 1-7종수술 상세 (별도 합산)
+    grade_base = {i: [] for i in range(1, 8)}
+    grade_extra = {i: [] for i in range(1, 8)}
 
     for cov in pdf_coverages:
         name = cov["특약명"]
         amount = cov["가입금액"]
+        name_simplified = simplify_pdf_name(name)
 
+        # 미래에셋 1-7종 상세 분류 ([1-7종]X종수술)
         for grade in range(1, 8):
-            patterns = [
-                f"[상해{grade}종]",
-                f"[질병{grade}종]",
-                f"〔상해{grade}종〕",
-                f"〔질병{grade}종〕",
-                f"_{grade}종수술",
-                f"_{grade}종 수술",
-                f"_{grade}종수술보험금",
-                f"_{grade}종 수술보험금",
-                # 흥국생명: 1~5종질병수술(분리형,1종) 또는 1~5종재해수술
-                f"분리형,{grade}종)",
-                f",{grade}종)",
-                # 흥국생명: 보장내용 상세 페이지에서 추출된 재해 종별 수술
-                f"[재해]{grade}종수술",
-            ]
-            matched = False
-            for pattern in patterns:
-                if pattern in name:
-                    grade_amounts[grade].append(amount)
-                    matched = True
-                    break
-            if matched:
+            if name == f"[1-7종]{grade}종수술":
+                grade_extra[grade].append(amount)
                 break
+        else:
+            # 기본 종별 수술 (1-5종, 질병/상해/재해)
+            for grade in range(1, 8):
+                patterns = [
+                    f"[상해{grade}종]",
+                    f"[질병{grade}종]",
+                    f"〔상해{grade}종〕",
+                    f"〔질병{grade}종〕",
+                    f"_{grade}종수술",
+                    f"_{grade}종 수술",
+                    f"_{grade}종수술보험금",
+                    f"_{grade}종 수술보험금",
+                    # 흥국생명: 1~5종질병수술(분리형,1종) 또는 1~5종재해수술
+                    f"분리형,{grade}종)",
+                    f",{grade}종)",
+                    # 흥국생명: 보장내용 상세 페이지에서 추출된 재해 종별 수술
+                    f"[재해]{grade}종수술",
+                    # 미래에셋: 1-5종수술(X종) 또는 1-5종수술특약(X종)
+                    f"({grade}종)",
+                ]
+                matched = False
+                for pattern in patterns:
+                    if pattern in name:
+                        grade_base[grade].append(amount)
+                        matched = True
+                        break
+                if not matched:
+                    # 미래에셋 simplified: '1-5종수술(X종)무배당' 패턴
+                    if f"({grade}종)" in name_simplified:
+                        grade_base[grade].append(amount)
+                        matched = True
+                if matched:
+                    break
 
     result = {}
-    for grade, amounts in grade_amounts.items():
-        if amounts:
-            result[grade] = min(amounts)
+    for grade in range(1, 8):
+        base_val = min(grade_base[grade]) if grade_base[grade] else 0
+        extra_val = max(grade_extra[grade]) if grade_extra[grade] else 0
+        total = base_val + extra_val
+        if total > 0:
+            result[grade] = total
 
     return result
 
@@ -144,6 +169,9 @@ def get_aggregated_amounts(pdf_coverages):
         # 흥국생명: (무)질병수술(체증형) → 질병수술비
         elif "질병수술(체증형)" in key or "질병수술(체증" in key:
             disease_surgery += amount
+        # 미래에셋: 질병수술무배당 (백내장 제외 아닌 순수 질병수술)
+        elif re.match(r'^질병수술[무배당최초]', key) and "백내장" not in key:
+            disease_surgery += amount
     if disease_surgery > 0:
         result["질병수술비"] = disease_surgery
 
@@ -157,6 +185,9 @@ def get_aggregated_amounts(pdf_coverages):
         # 흥국생명: (무)재해수술보장 → 상해수술비
         elif "재해수술보장" in key and "상해수술비" not in result:
             result["상해수술비"] = amount
+        # 미래에셋: 재해수술무배당 → 상해수술비
+        elif re.match(r'^재해수술[무배당최초]', key) and "상해수술비" not in result:
+            result["상해수술비"] = amount
 
     # 뇌혈관질환 수술비
     brain_surgery = 0
@@ -164,6 +195,9 @@ def get_aggregated_amounts(pdf_coverages):
         if "뇌혈관질환수술비" in key and "130대" not in key:
             brain_surgery += amount
         elif "130대질병수술비" in key and "뇌혈관질환" in key:
+            brain_surgery += amount
+        # 미래에셋: 뇌혈관질환수술(최초1회한) → 뇌혈관질환수술비
+        elif "뇌혈관질환수술" in key and "130대" not in key:
             brain_surgery += amount
     if brain_surgery > 0:
         result["뇌혈수술비"] = brain_surgery
@@ -175,6 +209,9 @@ def get_aggregated_amounts(pdf_coverages):
         if "허혈성심장질환수술비" in key and "130대" not in key:
             heart_surgery += amount
         elif "130대질병수술비" in key and "심장질환" in key:
+            heart_surgery += amount
+        # 미래에셋: 허혈성심장질환수술(최초1회한) → 허혈성심장질환수술비
+        elif "허혈성심장질환수술" in key and "130대" not in key:
             heart_surgery += amount
     if heart_surgery > 0:
         result["허혈성심장질환수술비"] = heart_surgery
@@ -278,11 +315,14 @@ def get_aggregated_amounts(pdf_coverages):
 
     # 일반사망 (주계약 사망보험금)
     # 흥국생명: 주계약 가입금액의 50% (재해 이외 원인으로 사망시)
+    # 미래에셋: 주계약(재해사망)만 있으면 일반사망 = 0
+    has_main_contract = False
     for cov in pdf_coverages:
         name = cov["특약명"]
-        if "통합보험" in name or "주계약" in name.lower():
-            # 주계약 가입금액 = 일반사망
+        # 흥국생명 통합보험 주계약 (일반사망 50% 포함)
+        if "통합보험" in name:
             result["일반사망"] = cov["가입금액"] // 2  # 50%
+            has_main_contract = True
             break
     # 별도 일반사망보장/종신사망 특약 우선
     for key, amount in simplified.items():
@@ -296,12 +336,13 @@ def get_aggregated_amounts(pdf_coverages):
         name = simplify_pdf_name(cov["특약명"])
         if "재해사망" in name:
             total_death += cov["가입금액"]
-    # 주계약에 재해사망 100% 포함시
-    for cov in pdf_coverages:
-        name = cov["특약명"]
-        if "통합보험" in name or "주계약" in name.lower():
-            total_death += cov["가입금액"]  # 재해 원인 100%
-            break
+    # 흥국생명: 주계약(통합보험)에 재해사망 100% 포함시 합산
+    if has_main_contract:
+        for cov in pdf_coverages:
+            name = cov["특약명"]
+            if "통합보험" in name:
+                total_death += cov["가입금액"]  # 재해 원인 100%
+                break
     if total_death > 0:
         result["상해사망/재해사망"] = total_death
 
@@ -362,11 +403,12 @@ MATCHING_RULES = {
         "암(유사암제외)진단", "암(유사암제외)",
         "암진단"  # 흥국생명: (무)암진단(갱신형)Ⅴ
     ]},
-    "소액/유사암": {"type": "direct", "keywords": [
+    "소액/유사암": {"type": "direct_exclude", "keywords": [
         "유사암진단비", "소액암진단비", "유사암진단",
         "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
-    ]},
-    "전이암진단비": {"type": "direct", "keywords": ["전이암진단비"]},
+    ], "exclude": ["제외"]},  # "암(유사암제외)진단" 제외
+    "전이암진단비": {"type": "direct", "keywords": ["전이암진단비", "전이암진단"]},
+    "전이암진단비": {"type": "direct", "keywords": ["전이암진단비", "전이암진단"]},
     "암주요치료비": {"type": "direct_exclude", "keywords": [
         "암주요치료비",
         "일반암주요치료"  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
@@ -408,10 +450,12 @@ MATCHING_RULES = {
 
     # 심장
     "심혈관질환진단비": {"type": "direct", "keywords": [
-        "심혈관질환진단비", "기타부정맥진단"  # 흥국생명: 기타부정맥진단
+        "심혈관질환진단비", "기타부정맥진단",  # 흥국생명: 기타부정맥진단
+        "부정맥진단",  # 미래에셋: 부정맥진단특약
     ]},
     "심혈관질환": {"type": "direct", "keywords": [
-        "심혈관질환진단비", "기타부정맥진단"  # 흥국생명: 기타부정맥진단
+        "심혈관질환진단비", "기타부정맥진단",  # 흥국생명: 기타부정맥진단
+        "부정맥진단",  # 미래에셋: 부정맥진단특약
     ]},
     "허혈성심장질환진단비": {"type": "aggregate", "key": "허혈성심장질환진단비"},
     "허혈성심장질환": {"type": "aggregate", "key": "허혈성심장질환진단비"},
@@ -422,7 +466,9 @@ MATCHING_RULES = {
     # 입원/응급
     "질병입원": {"type": "direct_exclude", "keywords": ["질병입원"], "exclude": ["다빈도", "특정"]},
     "상해입원": {"type": "direct", "keywords": ["상해입원"]},
-    "응급실내원(응급)": {"type": "direct", "keywords": ["응급실내원(응급)"]},
+    "응급실내원(응급)": {"type": "direct", "keywords": [
+        "응급실내원(응급)", "응급실내원"  # 미래에셋: 응급실내원특약 (응급/비응급 구분 없음)
+    ]},
     "응급실내원(비응급)": {"type": "direct", "keywords": ["응급실내원(비응급)"]},
 
     # 사망
@@ -433,11 +479,13 @@ MATCHING_RULES = {
     # 후유장해
     "상해후유장해3%": {"type": "direct", "keywords": [
         "상해3%이상후유장해", "상해후유장해3%",
-        "재해후유장해보장", "재해후유장해"  # 흥국생명: 재해후유장해보장
+        "재해후유장해보장", "재해후유장해",  # 흥국생명: 재해후유장해보장
+        "재해장해"  # 미래에셋: 재해장해보장특약
     ]},
     "질병후유장해3%": {"type": "direct", "keywords": [
         "질병3%이상후유장해", "질병후유장해3%",
-        "질병후유장해보장", "질병후유장해"  # 흥국생명: 질병후유장해보장
+        "질병후유장해보장", "질병후유장해",  # 흥국생명: 질병후유장해보장
+        "질병장해"  # 미래에셋: 질병장해보장특약
     ]},
     "상해후유장해": {"type": "direct", "keywords": [
         "상해후유장해", "일반상해80%이상후유장해",
@@ -448,7 +496,7 @@ MATCHING_RULES = {
     # 골절
     "골절진단": {"type": "aggregate", "key": "골절진단"},
     "골절수술": {"type": "aggregate", "key": "골절수술비"},
-    "깁스": {"type": "direct", "keywords": ["깁스"]},
+    "깁스": {"type": "direct", "keywords": ["깁스치료", "깁스"]},
 
     # 치매
     "경도치매": {"type": "direct", "keywords": ["경도치매"]},

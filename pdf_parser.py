@@ -442,6 +442,12 @@ def extract_coverage_mirae(pdf_path):
                 "가입금액": main_info["amount"]
             })
 
+    # 1-7종수술 종별 세부금액 추출 (보장내역 상세 페이지에서)
+    surgery_details = _extract_mirae_surgery_grade_detail(pdf_path)
+    for r in surgery_details:
+        if not any(existing["특약명"] == r["특약명"] for existing in results):
+            results.append(r)
+
     return results
 
 
@@ -459,13 +465,34 @@ def _detect_person_name(lines):
 
 
 def _parse_mirae_blocks(lines, person_name):
-    """미래에셋 PDF를 블록 단위로 파싱하여 특약명+가입금액 추출"""
+    """미래에셋 PDF를 블록 단위로 파싱하여 특약명+가입금액 추출
+    
+    2가지 줄 패턴:
+      패턴 A: 특약명+고객님+금액이 한 줄에 있음
+        예: '유사암진단특약(갱신형)무배당최초계약 고객님 1,000 33 ...'
+      패턴 B: 특약명이 이전 줄, 고객님+금액이 다음 줄
+        예: '암(유사암제외)진단특약(갱신형)무배당'
+            '고객님 5,000 33 ...'
+    """
     results = []
     if not person_name:
         return results
 
     name_buffer = ""
     i = 0
+
+    skip_line_keywords = [
+        "가입안내서", "발행번호", "Page", "FC :", "Tel :",
+        "발행일시", "동일한 번호", "페이지로 구성",
+        "어센틱금융", "함께하는",
+    ]
+
+    coverage_keywords = [
+        "특약", "진단", "수술", "치료", "입원", "통원",
+        "골절", "깁스", "사망", "장해", "배상", "벌금",
+        "주계약", "보장", "보험금", "응급", "부정맥", "심부전",
+        "통풍", "대상포진", "요로결석", "중환자",
+    ]
 
     while i < len(lines):
         line = lines[i].strip()
@@ -475,13 +502,12 @@ def _parse_mirae_blocks(lines, person_name):
         if not line_clean:
             continue
 
-        if any(kw in line_clean for kw in [
-            "가입안내서", "발행번호", "Page", "FC :", "Tel :",
-            "발행일시", "동일한 번호", "페이지로 구성",
-        ]):
+        if any(kw in line_clean for kw in skip_line_keywords):
             continue
 
         if person_name in line_clean:
+            # 고객님이 포함된 줄 → 금액 추출
+            before_person = line_clean.split(person_name)[0].strip()
             after_person = line_clean.split(person_name)[-1].strip()
             amount_match = re.search(r'^[\s,]*(\d[\d,]*)', after_person)
 
@@ -502,6 +528,8 @@ def _parse_mirae_blocks(lines, person_name):
                             amount = val * 10000
                             break
 
+            # 패턴 B 우선: name_buffer가 있으면 이전 줄의 특약명 사용
+            # (줄이 나뉜 경우: 특약명이 이전 줄, 고객님+금액이 현재 줄)
             if amount and name_buffer:
                 clean_name = _clean_mirae_coverage_name(name_buffer)
                 if clean_name and len(clean_name) >= 2:
@@ -510,7 +538,18 @@ def _parse_mirae_blocks(lines, person_name):
                         continue
                     if not any(r["특약명"] == clean_name for r in results):
                         results.append({"특약명": clean_name, "가입금액": amount})
+                name_buffer = ""
+                continue
 
+            # 패턴 A: 특약명이 같은 줄에 있는 경우 (고객님 앞부분이 특약명)
+            # name_buffer가 없을 때만 사용 (줄이 나뉘지 않은 단일 줄 패턴)
+            if amount and before_person and len(before_person) >= 4:
+                inline_name = _clean_mirae_coverage_name(before_person)
+                if inline_name and len(inline_name) >= 2 and "납입면제" not in inline_name:
+                    if not any(r["특약명"] == inline_name for r in results):
+                        results.append({"특약명": inline_name, "가입금액": amount})
+                name_buffer = ""
+                continue
             name_buffer = ""
             continue
 
@@ -536,12 +575,6 @@ def _parse_mirae_blocks(lines, person_name):
             continue
         if re.match(r'^최대\s+\d+', line_clean):
             continue
-
-        coverage_keywords = [
-            "특약", "진단", "수술", "치료", "입원", "통원",
-            "골절", "깁스", "사망", "장해", "배상", "벌금",
-            "주계약", "보장", "보험금",
-        ]
 
         has_keyword = any(kw in line_clean for kw in coverage_keywords)
 
@@ -611,6 +644,43 @@ def _map_main_benefit_name(benefit_raw):
         if key in benefit_clean:
             return value
     return f"주계약({benefit_raw})"
+
+
+def _extract_mirae_surgery_grade_detail(pdf_path):
+    """미래에셋 PDF 보장내역에서 1-7종수술 종별 상세 금액 추출
+    
+    PDF 18~19페이지 부근에서 1-7종수술분류표의 종별 금액을 찾아서
+    개별 특약으로 추가. 예: 1종 10만원, 2종 20만원, ..., 7종 500만원
+    """
+    grade_results = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            max_page = min(len(pdf.pages), 25)
+            for i in range(14, max_page):  # 15페이지부터
+                page = pdf.pages[i]
+                text = page.extract_text() or ""
+                
+                if '1-7종수술' not in text:
+                    continue
+                
+                # 패턴: X종 YY만원 (연속)
+                grade_amounts = re.findall(r'(\d)종\s+(\d[\d,]*만원)', text)
+                for grade_str, amount_str in grade_amounts:
+                    grade = int(grade_str)
+                    if 1 <= grade <= 7:
+                        amount = parse_amount(amount_str)
+                        if amount:
+                            name = f"[1-7종]{grade}종수술"
+                            # 중복 체크
+                            if not any(r["특약명"] == name for r in grade_results):
+                                grade_results.append({
+                                    "특약명": name,
+                                    "가입금액": amount
+                                })
+    except Exception:
+        pass
+    
+    return grade_results
 
 
 def _parse_mirae_benefit_section(pdf_path):
