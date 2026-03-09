@@ -81,7 +81,11 @@ def simplify_excel_name(name):
 
 
 def get_surgery_grade_amounts(pdf_coverages):
-    """1종~7종 수술비의 상해/질병별 금액을 모두 수집하고 각 종별 최소값 반환"""
+    """1종~7종 수술비의 상해/질병별 금액을 모두 수집하고 각 종별 최소값 반환
+    
+    질병/상해 양쪽에 종별 수술이 있으면 min(질병, 상해)를 표시.
+    흥국생명: '[재해]X종수술' (보장내용에서 추출된 종별 재해수술)도 인식.
+    """
     grade_amounts = {i: [] for i in range(1, 8)}
 
     for cov in pdf_coverages:
@@ -101,6 +105,8 @@ def get_surgery_grade_amounts(pdf_coverages):
                 # 흥국생명: 1~5종질병수술(분리형,1종) 또는 1~5종재해수술
                 f"분리형,{grade}종)",
                 f",{grade}종)",
+                # 흥국생명: 보장내용 상세 페이지에서 추출된 재해 종별 수술
+                f"[재해]{grade}종수술",
             ]
             matched = False
             for pattern in patterns:
@@ -199,19 +205,23 @@ def get_aggregated_amounts(pdf_coverages):
             result["허혈성심장질환진단비"] = amount
             break
 
-    # 항암방사선약물치료비 (항암약물치료 + 항암방사선치료 합산)
+    # 항암방사선약물치료비 (항암약물치료 + 항암방사선치료 합산, 소액암·주요치료 제외)
     antineoplastic_total = 0
+    # 제외 키워드: 소액암, 호르몬, 통합, 세기조절, 양성자, 중입자, 표적, 카티, 주요치료, 종합병원
+    exclude_kws = ["소액암", "호르몬", "통합", "세기조절", "양성자", "중입자", "표적", "카티", "주요치료", "종합병원"]
     for key, amount in simplified.items():
-        key_lower = key.lower()
-        # 직접 합산 항목들
+        # 직접 합산 항목들 (항암약물치료비, 항암방사선약물치료비 — 단일 특약)
         if ("항암약물치료비" in key or "항암방사선약물치료비" in key):
-            antineoplastic_total = amount
-            break
+            if not any(ex in key for ex in exclude_kws):
+                antineoplastic_total = amount
+                break
         # 흥국생명: (무)항암약물치료 + (무)항암방사선치료 합산
-        if "항암약물치료" in key and "방사선" not in key and "소액암" not in key and "호르몬" not in key and "통합" not in key and "세기조절" not in key and "양성자" not in key and "중입자" not in key and "표적" not in key and "카티" not in key:
-            antineoplastic_total += amount
-        elif "항암방사선치료" in key and "소액암" not in key and "세기조절" not in key and "양성자" not in key and "중입자" not in key and "통합" not in key:
-            antineoplastic_total += amount
+        if "항암약물치료" in key and "방사선" not in key:
+            if not any(ex in key for ex in exclude_kws):
+                antineoplastic_total += amount
+        elif "항암방사선치료" in key:
+            if not any(ex in key for ex in exclude_kws):
+                antineoplastic_total += amount
     if antineoplastic_total > 0:
         result["항암방사선약물치료비"] = antineoplastic_total
 
@@ -321,7 +331,10 @@ MATCHING_RULES = {
         "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
     ]},
     "전이암진단비": {"type": "direct", "keywords": ["전이암진단비"]},
-    "암주요치료비": {"type": "direct", "keywords": ["암주요치료비"]},
+    "암주요치료비": {"type": "direct_exclude", "keywords": [
+        "암주요치료비",
+        "일반암주요치료"  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
+    ], "exclude": ["소액암"]},
     "항암방사선약물치료비": {"type": "aggregate", "key": "항암방사선약물치료비"},
     "표적항암약물치료비": {"type": "direct", "keywords": [
         "표적항암약물치료비", "표적항암약물허가치료"
@@ -340,10 +353,12 @@ MATCHING_RULES = {
     "카티항암약물치료비": {"type": "direct", "keywords": [
         "카티항암약물치료비", "카티항암약물허가치료", "CAR-T"
     ]},
-    "다빈치로봇수술비": {"type": "direct", "keywords": [
+    "다빈치로봇수술비": {"type": "direct_exclude", "keywords": [
         "다빈치로봇수술비", "다빈치로봇수술",
-        "암다빈치로봇수술"
-    ]},
+        "암다빈치로봇수술",
+        "로봇암(특정암제외)수술",  # 흥국생명: (무)로봇암(특정암제외)수술(다빈치,레보아이)
+        "로봇암수술", "로봇수술"
+    ], "exclude": ["종합병원", "주요치료", "소액암"]},
 
     # 뇌
     "뇌혈관질환진단비": {"type": "aggregate", "key": "뇌혈관질환진단비"},

@@ -911,6 +911,9 @@ def _parse_heungkuk_coverage_table(table):
         if not row or len(row) <= max(name_col, amount_col):
             continue
         
+        # 주계약 여부 확인 (row[0]이 "주계약"이면 skip_names 체크 제외)
+        is_main_contract = (row[0] and str(row[0]).strip() == "주계약")
+        
         # 특약명 추출
         name = row[name_col]
         if not name:
@@ -928,15 +931,16 @@ def _parse_heungkuk_coverage_table(table):
         if len(name) < 4:
             continue
         
-        # 스킵 항목
-        name_nospace = name.replace(" ", "")
-        if any(sk in name_nospace for sk in skip_names):
-            continue
-        if re.match(r'^[\d,.\s%원]+$', name):
-            continue
-        # 보험가입조건 테이블의 행 스킵
-        if '상령일' in name or '계약자' in name_nospace or '피보험자' in name_nospace:
-            continue
+        # 스킵 항목 (주계약 행은 스킵하지 않음 — 일반사망/재해사망 계산에 필요)
+        if not is_main_contract:
+            name_nospace = name.replace(" ", "")
+            if any(sk in name_nospace for sk in skip_names):
+                continue
+            if re.match(r'^[\d,.\s%원]+$', name):
+                continue
+            # 보험가입조건 테이블의 행 스킵
+            if '상령일' in name or '계약자' in name_nospace or '피보험자' in name_nospace:
+                continue
         
         # 가입금액 추출
         amount = None
@@ -957,6 +961,45 @@ def _parse_heungkuk_coverage_table(table):
                 results.append({"특약명": name, "가입금액": amount})
     
     return results
+
+
+def _extract_heungkuk_surgery_grade_detail(pdf_path):
+    """흥국생명 보장내용 상세 페이지에서 1~5종 재해수술 종별 금액 추출
+    
+    보장내용 페이지(약 15~25페이지)에서 '1~5종재해수술' 관련 상세 금액을 파싱.
+    패턴: '1종 10만원', '2종 25만원' 등이 연속으로 나옴.
+    """
+    grade_results = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            max_page = min(len(pdf.pages), 30)
+            for i in range(14, max_page):  # 15페이지부터 (0-indexed: 14)
+                page = pdf.pages[i]
+                text = page.extract_text() or ""
+                
+                # '1~5종재해수술' 상세 설명이 있는 페이지
+                if '재해수술' not in text or '수술분류표' not in text:
+                    continue
+                
+                # 패턴: X종 YY만원 (연속으로 1~5종)
+                grade_amounts = re.findall(r'(\d)종\s+(\d[\d,]*만원)', text)
+                if len(grade_amounts) >= 3:  # 최소 3종 이상 발견시
+                    for grade_str, amount_str in grade_amounts:
+                        grade = int(grade_str)
+                        if 1 <= grade <= 5:
+                            amount = parse_amount(amount_str)
+                            if amount:
+                                name = f"[재해]{grade}종수술"
+                                grade_results.append({
+                                    "특약명": name,
+                                    "가입금액": amount
+                                })
+                    if grade_results:
+                        break  # 첫 발견 시 중단
+    except Exception:
+        pass
+    
+    return grade_results
 
 
 def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path):
@@ -984,6 +1027,13 @@ def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path):
             for r in text_results:
                 if not any(existing["특약명"] == r["특약명"] for existing in results):
                     results.append(r)
+    
+    # 3차: 1~5종 재해수술 종별 세부금액 추출 (보장내용 상세 페이지에서)
+    if pdf_path:
+        surgery_details = _extract_heungkuk_surgery_grade_detail(pdf_path)
+        for r in surgery_details:
+            if not any(existing["특약명"] == r["특약명"] for existing in results):
+                results.append(r)
     
     return results
 
