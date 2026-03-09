@@ -205,25 +205,61 @@ def get_aggregated_amounts(pdf_coverages):
             result["허혈성심장질환진단비"] = amount
             break
 
-    # 항암방사선약물치료비 (항암약물치료 + 항암방사선치료 합산, 소액암·주요치료 제외)
-    antineoplastic_total = 0
-    # 제외 키워드: 소액암, 호르몬, 통합, 세기조절, 양성자, 중입자, 표적, 카티, 주요치료, 종합병원
-    exclude_kws = ["소액암", "호르몬", "통합", "세기조절", "양성자", "중입자", "표적", "카티", "주요치료", "종합병원"]
+    # 항암방사선약물치료비
+    # ─────────────────────────────────────────────────────────
+    # 규칙:
+    #   단일 특약 "항암방사선약물치료비" → 그 금액 그대로
+    #   분리형 "항암방사선치료" + "항암약물치료" → min(방사선, 약물)
+    #     (어차피 방사선 치료시/약물 치료시 각각 나오므로 합산이 아닌 최소값)
+    #   통합형 "통합항암약물방사선치료" → 단일 금액 (종별 있어도 하나)
+    #   분리형 + 통합형 공존 → min(분리 방사선, 분리 약물) + 통합형
+    # ─────────────────────────────────────────────────────────
+    exclude_kws = ["소액암", "호르몬", "세기조절", "양성자", "중입자", "표적", "카티", "주요치료", "종합병원"]
+    
+    # 1) 단일 통합 특약 확인 ("항암방사선약물치료비" 이름 그대로)
+    single_combined = 0
     for key, amount in simplified.items():
-        # 직접 합산 항목들 (항암약물치료비, 항암방사선약물치료비 — 단일 특약)
-        if ("항암약물치료비" in key or "항암방사선약물치료비" in key):
-            if not any(ex in key for ex in exclude_kws):
-                antineoplastic_total = amount
+        if ("항암방사선약물치료비" in key or "항암약물방사선치료비" in key):
+            if not any(ex in key for ex in exclude_kws) and "통합" not in key:
+                single_combined = amount
                 break
-        # 흥국생명: (무)항암약물치료 + (무)항암방사선치료 합산
-        if "항암약물치료" in key and "방사선" not in key:
-            if not any(ex in key for ex in exclude_kws):
-                antineoplastic_total += amount
-        elif "항암방사선치료" in key:
-            if not any(ex in key for ex in exclude_kws):
-                antineoplastic_total += amount
-    if antineoplastic_total > 0:
-        result["항암방사선약물치료비"] = antineoplastic_total
+    
+    if single_combined > 0:
+        # 단일 특약이 있으면 그 금액 그대로
+        result["항암방사선약물치료비"] = single_combined
+    else:
+        # 2) 분리형 수집: 항암약물치료(방사선 미포함), 항암방사선치료(약물 미포함)
+        drug_amount = 0
+        radiation_amount = 0
+        for key, amount in simplified.items():
+            if any(ex in key for ex in exclude_kws):
+                continue
+            if "통합" in key:
+                continue
+            if "항암약물치료" in key and "방사선" not in key and "약물방사선" not in key:
+                drug_amount = max(drug_amount, amount)  # 동명 특약 중 최대
+            elif "항암방사선치료" in key and "약물" not in key and "방사선약물" not in key:
+                radiation_amount = max(radiation_amount, amount)
+        
+        separated_value = 0
+        if drug_amount > 0 and radiation_amount > 0:
+            separated_value = min(drug_amount, radiation_amount)
+        elif drug_amount > 0:
+            separated_value = drug_amount
+        elif radiation_amount > 0:
+            separated_value = radiation_amount
+        
+        # 3) 통합형 수집: "통합항암약물방사선치료" (종별 있어도 금액 동일 → 하나로)
+        integrated_amount = 0
+        for key, amount in simplified.items():
+            if "통합" in key and "항암" in key and ("약물" in key or "방사선" in key):
+                if not any(ex in key for ex in exclude_kws):
+                    integrated_amount = max(integrated_amount, amount)
+        
+        # 4) 합산: 분리형 min값 + 통합형
+        antineoplastic_total = separated_value + integrated_amount
+        if antineoplastic_total > 0:
+            result["항암방사선약물치료비"] = antineoplastic_total
 
     # 일반상해사망 / 재해사망
     death_amount = 0
@@ -384,7 +420,7 @@ MATCHING_RULES = {
     "급성심근경색": {"type": "direct", "keywords": ["급성심근경색진단비", "급성심근경색증진단비"]},
 
     # 입원/응급
-    "질병입원": {"type": "direct", "keywords": ["질병입원"]},
+    "질병입원": {"type": "direct_exclude", "keywords": ["질병입원"], "exclude": ["다빈도", "특정"]},
     "상해입원": {"type": "direct", "keywords": ["상해입원"]},
     "응급실내원(응급)": {"type": "direct", "keywords": ["응급실내원(응급)"]},
     "응급실내원(비응급)": {"type": "direct", "keywords": ["응급실내원(비응급)"]},

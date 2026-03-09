@@ -1076,7 +1076,15 @@ def _extract_coverage_heungkuk_limited(pdf_path):
 
 def extract_coverage_heungkuk(pdf_path):
     """흥국생명 PDF 파싱 — 제한된 페이지만 처리 (호환 인터페이스)"""
-    return _extract_coverage_heungkuk_limited(pdf_path)
+    results = _extract_coverage_heungkuk_limited(pdf_path)
+    
+    # 1~5종 재해수술 종별 세부금액 추출 (보장내용 상세 페이지에서)
+    surgery_details = _extract_heungkuk_surgery_grade_detail(pdf_path)
+    for r in surgery_details:
+        if not any(existing["특약명"] == r["특약명"] for existing in results):
+            results.append(r)
+    
+    return results
 
 
 def _parse_heungkuk_text(text):
