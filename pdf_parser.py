@@ -1,5 +1,7 @@
 import pdfplumber
 import re
+import signal
+import threading
 
 # PyMuPDF — 텍스트 추출 전용 (pdfplumber 대비 50배+ 빠름)
 try:
@@ -7,6 +9,39 @@ try:
     HAS_PYMUPDF = True
 except ImportError:
     HAS_PYMUPDF = False
+
+
+def _pymupdf_extract_texts_safe(pdf_path, timeout_sec=15):
+    """PyMuPDF 텍스트 추출 — 타임아웃 안전 래퍼.
+    일부 PDF에서 PyMuPDF가 hang되는 현상 대응.
+    타임아웃 시 빈 리스트 반환 → pdfplumber 폴백.
+    """
+    result_container = [None]
+    error_container = [None]
+
+    def _worker():
+        try:
+            doc = _fitz.open(pdf_path)
+            texts = []
+            for page in doc:
+                texts.append(page.get_text() or "")
+            doc.close()
+            result_container[0] = texts
+        except Exception as e:
+            error_container[0] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        # 타임아웃 — PyMuPDF hang
+        print(f"[WARN] PyMuPDF timed out ({timeout_sec}s) for {pdf_path}, falling back to pdfplumber")
+        return None
+    if error_container[0]:
+        print(f"[WARN] PyMuPDF error: {error_container[0]}, falling back to pdfplumber")
+        return None
+    return result_container[0]
 
 
 def detect_insurer(pdf_path):
@@ -61,12 +96,20 @@ def detect_insurer(pdf_path):
 def detect_product_name(pdf_path):
     """PDF에서 상품명 추출"""
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages[:3]:
+        for page in pdf.pages[:10]:
             text = page.extract_text()
             if not text:
                 continue
             for line in text.split('\n'):
                 line = line.strip()
+
+                # 보험상품명 라벨이 있는 줄 (흥국생명 등)
+                product_label_match = re.search(r'보험상품명\s+(.+)', line)
+                if product_label_match:
+                    name = product_label_match.group(1).strip()
+                    name = re.sub(r'^\(무\)\s*', '', name).strip()
+                    if len(name) > 4:
+                        return name[:50] if len(name) > 50 else name
 
                 kb_match = re.search(r'(KB\s*플러스\s*[^\(\n]+보험)', line)
                 if kb_match:
@@ -91,14 +134,14 @@ def detect_product_name(pdf_path):
                     return name
 
                 if re.match(r'^\(무\)|^\(유\)', line):
-                    name = line
-                    name = re.sub(r'^\(무\)\s*|^\(유\)\s*', '', name)
-                    match = re.match(r'^([^(]+)', name)
-                    if match:
-                        name = match.group(1).strip()
-                    if len(name) > 30:
-                        name = name[:30]
-                    return name
+                    name = re.sub(r'^\(무\)\s*|^\(유\)\s*', '', line)
+                    # 상품명에 '보험' 포함 필수 (표지의 짧은 줄 제외)
+                    if '보험' in name:
+                        name = name.strip()
+                        if len(name) > 50:
+                            name = name[:50]
+                        return name
+                    # '보험' 없으면 스킵 (표지 줄일 수 있음)
 
                 samsung_match = re.match(r'^삼성\s+(.+보험)', line)
                 if samsung_match:
@@ -807,166 +850,183 @@ def extract_coverage_samsung_table(pdf_path):
 
 
 # ══════════════════════════════════════════════
-# 흥국생명 전용 파서
+# 흥국생명 전용 파서 (실제 PDF 구조 기반)
 # ══════════════════════════════════════════════
+# 흥국생명 가입제안서 테이블 구조:
+#   헤더: [상품명, None, 가입금액, 보험기간, 납입기간, 보험료]
+#   데이터: [주계약/선택특약/None, 특약명, 가입금액, 보험기간, 납입기간, 보험료]
+#   → 특약명은 column[1], 가입금액은 column[2]
 
-def extract_coverage_heungkuk(pdf_path):
-    """흥국생명 PDF 파싱 — 테이블 기반 + 텍스트 보완 하이브리드
+
+def _parse_heungkuk_coverage_table(table):
+    """흥국생명 보장 테이블에서 특약명/가입금액 추출
     
-    흥국생명 가입제안서 구조:
-    - 보장내역/특약 테이블이 있는 페이지에서 테이블 추출
-    - 테이블 실패 시 텍스트 기반 패턴 매칭으로 보완
-    - 금액은 만원/원 단위 혼용
+    실제 테이블 구조:
+    row[0] = '주계약'/'선택특약'/None (구분)
+    row[1] = 특약명 (줄바꿈 포함)
+    row[2] = 가입금액 ('5,000만원' 등)
+    row[3] = 보험기간
+    row[4] = 납입기간  
+    row[5] = 보험료
     """
     results = []
+    if not table or len(table) < 2:
+        return results
     
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text()
+    # 헤더 확인 — '상품명' 또는 '가입금액' 포함 여부
+    header_idx = None
+    for idx, row in enumerate(table[:3]):
+        row_text = " ".join(str(c or '') for c in row)
+        if '상품명' in row_text or '가입금액' in row_text:
+            header_idx = idx
+            break
+    
+    if header_idx is None:
+        return results
+    
+    # 가입금액 컬럼 인덱스 찾기
+    amount_col = 2  # 기본값
+    header = table[header_idx]
+    for j, cell in enumerate(header):
+        if cell and '가입금액' in str(cell).replace(' ', ''):
+            amount_col = j
+            break
+    
+    # 특약명 컬럼: amount_col 바로 왼쪽
+    name_col = amount_col - 1
+    if name_col < 0:
+        name_col = 0
+    
+    skip_names = [
+        "주계약", "선택특약", "필수특약", "의무특약",
+        "합계", "총보험료", "보장보험료", "보험료합계",
+        "2회차이후", "1회차보험료", "계약자명",
+        "보장보험료합계", "적립보험료", "할인보험료",
+        "선택계약", "보험료사항", "보험료자동납입",
+        "주의사항", "기본계약", "납입면제", "합계보험료",
+        "실납입보험료"
+    ]
+    
+    for row in table[header_idx + 1:]:
+        if not row or len(row) <= max(name_col, amount_col):
+            continue
+        
+        # 특약명 추출
+        name = row[name_col]
+        if not name:
+            # 첫 번째 컬럼에 특약명이 있을 수 있음 (일부 행)
+            if name_col > 0 and row[0]:
+                candidate = str(row[0]).replace('\n', ' ').strip()
+                if len(candidate) > 5 and any(kw in candidate for kw in ['보장', '특약', '진단', '수술', '치료', '입원', '사망', '장해']):
+                    name = row[0]
+            if not name:
+                continue
+        
+        name = str(name).replace('\n', ' ')
+        name = re.sub(r'\s+', ' ', name).strip()
+        
+        if len(name) < 4:
+            continue
+        
+        # 스킵 항목
+        name_nospace = name.replace(" ", "")
+        if any(sk in name_nospace for sk in skip_names):
+            continue
+        if re.match(r'^[\d,.\s%원]+$', name):
+            continue
+        # 보험가입조건 테이블의 행 스킵
+        if '상령일' in name or '계약자' in name_nospace or '피보험자' in name_nospace:
+            continue
+        
+        # 가입금액 추출
+        amount = None
+        if len(row) > amount_col and row[amount_col]:
+            amount = parse_amount(str(row[amount_col]))
+        
+        # 가입금액이 없으면 다른 셀에서 찾기
+        if amount is None:
+            for j, cell in enumerate(row):
+                if cell and j != name_col:
+                    parsed = parse_amount(str(cell))
+                    if parsed:
+                        amount = parsed
+                        break
+        
+        if name and amount:
+            if not any(r["특약명"] == name for r in results):
+                results.append({"특약명": name, "가입금액": amount})
+    
+    return results
+
+
+def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path):
+    """흥국생명 - 캐시된 테이블에서 추출 (parse_pdf_all_in_one 전용)"""
+    results = []
+    
+    # 1차: 캐시된 테이블에서 추출
+    for page_idx in sorted(page_tables.keys()):
+        tables = page_tables[page_idx]
+        for table in tables:
+            page_results = _parse_heungkuk_coverage_table(table)
+            for r in page_results:
+                if not any(existing["특약명"] == r["특약명"] for existing in results):
+                    results.append(r)
+    
+    # 2차: 테이블 추출 실패 시 텍스트 기반 보완
+    if not results:
+        texts = page_texts if page_texts else []
+        for page_idx, text in enumerate(texts):
             if not text:
                 continue
-            
-            # 보장내역/특약 관련 페이지만 처리
-            if not any(kw in text for kw in [
-                '특약', '담보', '가입금액', '보장내용', '보장내역',
-                '가입담보', '보장항목', '보장보험료', '보험가입금액'
-            ]):
+            if not any(kw in text for kw in ['가입금액', '보험료', '보장내역']):
                 continue
-            
-            # 1차: 테이블 추출 시도
-            page_results = _parse_heungkuk_table(page)
-            
-            # 2차: 테이블에서 못 찾으면 텍스트 기반 추출
-            if not page_results:
-                page_results = _parse_heungkuk_text(text)
-            
-            for r in page_results:
+            text_results = _parse_heungkuk_text(text)
+            for r in text_results:
                 if not any(existing["특약명"] == r["특약명"] for existing in results):
                     results.append(r)
     
     return results
 
 
-def _parse_heungkuk_table(page):
-    """흥국생명 페이지에서 테이블 기반 특약 추출"""
+def _extract_coverage_heungkuk_limited(pdf_path):
+    """흥국생명 - pdfplumber로 제한된 페이지만 처리 (전체 PDF 재오픈 금지)
+    
+    보장 테이블은 보통 페이지 4~14에 위치.
+    """
     results = []
-    
-    # 테이블 추출 (선 기반 우선, 실패 시 텍스트 기반)
-    tables = page.extract_tables({
-        'vertical_strategy': 'lines',
-        'horizontal_strategy': 'lines',
-        'snap_tolerance': 5,
-        'join_tolerance': 5,
-    })
-    if not tables:
-        tables = page.extract_tables({
-            'vertical_strategy': 'text',
-            'horizontal_strategy': 'text',
-        })
-    if not tables:
-        return results
-    
-    header_keywords = [
-        "가입담보", "담보명", "특약명", "보장명", "담보내용",
-        "보장항목", "보장내용", "급부명", "보장담보", "보험종목",
-        "보장종목", "가입담보및보장내용", "특약"
-    ]
-    amount_keywords = ["가입금액", "보험가입금액", "보장금액"]
-    sub_prefix_pattern = re.compile(r'^┗?\s*\d+\s+')
-    
-    for table in tables:
-        if not table or len(table) < 2:
-            continue
-        
-        header_idx = None
-        name_col = None
-        amount_col = None
-        
-        # 헤더 행 탐색
-        for idx, row in enumerate(table):
-            if idx > 5:
+    with pdfplumber.open(pdf_path) as pdf:
+        max_page = min(len(pdf.pages), 15)
+        for i in range(3, max_page):  # 페이지 4부터 (0-indexed: 3)
+            page = pdf.pages[i]
+            text = page.extract_text() or ""
+            
+            # 보장 관련 키워드가 있는 페이지만
+            if not any(kw in text for kw in ['가입금액', '상품명', '보험료']):
+                continue
+            
+            tables = page.extract_tables({
+                'vertical_strategy': 'lines',
+                'horizontal_strategy': 'lines',
+                'snap_tolerance': 5,
+                'join_tolerance': 5,
+            })
+            
+            for table in tables:
+                page_results = _parse_heungkuk_coverage_table(table)
+                for r in page_results:
+                    if not any(existing["특약명"] == r["특약명"] for existing in results):
+                        results.append(r)
+            
+            # 합계보험료가 나오면 이후 페이지는 약관이므로 중단
+            if '합계보험료' in text:
                 break
-            for j, cell in enumerate(row):
-                if not cell:
-                    continue
-                cell_clean = cell.replace(" ", "").replace("\n", "")
-                if any(kw in cell_clean for kw in header_keywords):
-                    header_idx = idx
-                    if name_col is None:
-                        name_col = j
-                if any(kw in cell_clean for kw in amount_keywords):
-                    amount_col = j
-            if header_idx is not None:
-                break
-        
-        if header_idx is None or amount_col is None:
-            continue
-        
-        # name_col이 안 잡혔으면 데이터에서 찾기
-        if name_col is None:
-            name_col = find_name_col_from_data(table, header_idx)
-        if name_col is None:
-            continue
-        
-        # 데이터 행 파싱
-        for row in table[header_idx + 1:]:
-            if not row or len(row) <= max(name_col, amount_col):
-                continue
-            
-            name = row[name_col]
-            if not name:
-                continue
-            
-            name = name.replace("\n", " ")
-            name = re.sub(r'\s+', ' ', name).strip()
-            
-            if len(name) < 4:
-                continue
-            
-            # 스킵 항목
-            name_nospace = name.replace(" ", "")
-            skip_names = [
-                "주계약", "선택특약", "필수특약", "의무특약",
-                "합계", "총보험료", "보장보험료", "보험료합계",
-                "2회차이후", "1회차보험료", "계약자명",
-                "보장보험료합계", "적립보험료", "할인보험료",
-                "선택계약", "보험료사항", "보험료자동납입",
-                "주의사항", "기본계약", "납입면제"
-            ]
-            if any(sk in name_nospace for sk in skip_names):
-                continue
-            if re.match(r'^[\d,.\s%원]+$', name):
-                continue
-            if re.match(r'^\d+년\s*\(\d+세\)', name_nospace):
-                continue
-            if "경우" in name and "지급" in name:
-                continue
-            
-            # 번호 접두사, (필수)/(선택) 제거
-            name = sub_prefix_pattern.sub('', name).strip()
-            name = re.sub(r'\(필수\)|\(선택\)', '', name).strip()
-            
-            if len(name) < 4:
-                continue
-            
-            # 금액 추출
-            amount = None
-            if len(row) > amount_col and row[amount_col]:
-                amount = parse_amount(row[amount_col])
-            
-            if amount is None:
-                for cell in row:
-                    if cell and cell != name:
-                        parsed = parse_amount(cell)
-                        if parsed:
-                            amount = parsed
-                            break
-            
-            if name and amount:
-                if not any(r["특약명"] == name for r in results):
-                    results.append({"특약명": name, "가입금액": amount})
     
     return results
+
+
+def extract_coverage_heungkuk(pdf_path):
+    """흥국생명 PDF 파싱 — 제한된 페이지만 처리 (호환 인터페이스)"""
+    return _extract_coverage_heungkuk_limited(pdf_path)
 
 
 def _parse_heungkuk_text(text):
@@ -974,160 +1034,32 @@ def _parse_heungkuk_text(text):
     results = []
     lines = text.split('\n')
     
-    # 패턴 1: 번호 + 특약명 + 금액 (한 줄에)
     for i, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
         
-        # 숫자(번호) + 특약명 + 금액 패턴
+        # 패턴: (무)특약명 가입금액
+        # 예: "(무)암진단(갱신형)Ⅴ 5,000만원 20년갱신 전기납 11,750원"
         match = re.match(
-            r'^(\d{1,4})\s+(.+?)\s+(\d[\d,]*(?:억|천만|백만|만|천)?원)',
+            r'^(?:\(무\)|[\(무\)])?(.+?)\s+(\d[\d,]*(?:만원|원))',
             line
         )
         if match:
-            name = match.group(2).strip()
-            amount_text = match.group(3).strip()
+            name = match.group(1).strip()
+            amount_text = match.group(2).strip()
             amount = parse_amount(amount_text)
             
             if name and amount and len(name) >= 4:
                 name_nospace = name.replace(" ", "")
                 skip_words = [
                     "합계보험료", "주보험", "납입면제",
-                    "보장보험료", "적립보험료"
+                    "보장보험료", "적립보험료", "실납입보험료",
+                    "계약자", "피보험자", "상령일"
                 ]
                 if not any(sk in name_nospace for sk in skip_words):
                     if not any(r["특약명"] == name for r in results):
                         results.append({"특약명": name, "가입금액": amount})
-            continue
-        
-        # 패턴 2: 특약 키워드가 포함된 줄 + 다음 줄에 금액
-        if any(kw in line for kw in [
-            "특약", "진단", "수술", "치료", "입원", "통원",
-            "골절", "사망", "장해", "보장", "담보"
-        ]):
-            # 같은 줄에 금액이 있는지 확인
-            amount_in_line = re.search(r'(\d[\d,]*(?:억|천만|백만|만|천)?원)', line)
-            if amount_in_line:
-                amount = parse_amount(amount_in_line.group(1))
-                name = line[:amount_in_line.start()].strip()
-                # 앞의 번호 제거
-                name = re.sub(r'^\d{1,4}\s+', '', name).strip()
-                if name and amount and len(name) >= 4:
-                    name_nospace = name.replace(" ", "")
-                    if not any(sk in name_nospace for sk in ["합계보험료", "납입면제", "보장보험료"]):
-                        if not any(r["특약명"] == name for r in results):
-                            results.append({"특약명": name, "가입금액": amount})
-    
-    return results
-
-
-def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path):
-    """흥국생명 - 캐시된 텍스트/테이블에서 추출 (parse_pdf_all_in_one 전용)"""
-    results = []
-    sub_prefix_pattern = re.compile(r'^┗?\s*\d+\s+')
-    
-    header_keywords = [
-        "가입담보", "담보명", "특약명", "보장명", "담보내용",
-        "보장항목", "보장내용", "급부명", "보장담보", "보험종목",
-        "보장종목", "가입담보및보장내용", "특약"
-    ]
-    amount_keywords = ["가입금액", "보험가입금액", "보장금액"]
-    
-    # 1차: 캐시된 테이블에서 추출
-    for page_idx, tables in page_tables.items():
-        for table in tables:
-            if not table or len(table) < 2:
-                continue
-            
-            header_idx = None
-            name_col = None
-            amount_col = None
-            
-            for idx, row in enumerate(table):
-                if idx > 5:
-                    break
-                for j, cell in enumerate(row):
-                    if not cell:
-                        continue
-                    cell_clean = cell.replace(" ", "").replace("\n", "")
-                    if any(kw in cell_clean for kw in header_keywords):
-                        header_idx = idx
-                        if name_col is None:
-                            name_col = j
-                    if any(kw in cell_clean for kw in amount_keywords):
-                        amount_col = j
-                if header_idx is not None:
-                    break
-            
-            if header_idx is None or amount_col is None:
-                continue
-            
-            if name_col is None:
-                name_col = find_name_col_from_data(table, header_idx)
-            if name_col is None:
-                continue
-            
-            for row in table[header_idx + 1:]:
-                if not row or len(row) <= max(name_col, amount_col):
-                    continue
-                
-                name = row[name_col]
-                if not name:
-                    continue
-                
-                name = name.replace("\n", " ")
-                name = re.sub(r'\s+', ' ', name).strip()
-                
-                if len(name) < 4:
-                    continue
-                
-                name_nospace = name.replace(" ", "")
-                skip_names = [
-                    "주계약", "선택특약", "필수특약", "의무특약",
-                    "합계", "총보험료", "보장보험료", "보험료합계",
-                    "2회차이후", "1회차보험료", "계약자명",
-                    "보장보험료합계", "적립보험료", "할인보험료",
-                    "선택계약", "보험료사항", "보험료자동납입",
-                    "주의사항", "기본계약", "납입면제"
-                ]
-                if any(sk in name_nospace for sk in skip_names):
-                    continue
-                if re.match(r'^[\d,.\s%원]+$', name):
-                    continue
-                
-                name = sub_prefix_pattern.sub('', name).strip()
-                name = re.sub(r'\(필수\)|\(선택\)', '', name).strip()
-                
-                if len(name) < 4:
-                    continue
-                
-                amount = None
-                if len(row) > amount_col and row[amount_col]:
-                    amount = parse_amount(row[amount_col])
-                
-                if amount is None:
-                    for cell in row:
-                        if cell and cell != name:
-                            parsed = parse_amount(cell)
-                            if parsed:
-                                amount = parsed
-                                break
-                
-                if name and amount:
-                    if not any(r["특약명"] == name for r in results):
-                        results.append({"특약명": name, "가입금액": amount})
-    
-    # 2차: 테이블에서 못 찾으면 텍스트 기반 보완
-    if not results:
-        for page_text in page_texts:
-            if not page_text:
-                continue
-            if any(kw in page_text for kw in ['특약', '담보', '가입금액', '보장내역']):
-                text_results = _parse_heungkuk_text(page_text)
-                for r in text_results:
-                    if not any(existing["특약명"] == r["특약명"] for existing in results):
-                        results.append(r)
     
     return results
 
@@ -1152,13 +1084,15 @@ def parse_pdf_all_in_one(pdf_path):
     page_texts = []          # pdfplumber 텍스트 (파서 호환용, 필요 페이지만)
     page_tables = {}         # {page_index: tables}
 
-    # ── 1단계: PyMuPDF로 빠른 전체 텍스트 추출 (0.2초) ──
+    # ── 1단계: PyMuPDF로 빠른 전체 텍스트 추출 (타임아웃 안전) ──
+    pymupdf_ok = False
     if HAS_PYMUPDF:
-        doc = _fitz.open(pdf_path)
-        for page in doc:
-            page_texts_fast.append(page.get_text() or "")
-        doc.close()
+        extracted = _pymupdf_extract_texts_safe(pdf_path, timeout_sec=15)
+        if extracted is not None:
+            page_texts_fast = extracted
+            pymupdf_ok = True
 
+    if pymupdf_ok:
         # 키워드 페이지 식별
         keyword_page_set = set()
         for i, text in enumerate(page_texts_fast):
@@ -1170,49 +1104,44 @@ def parse_pdf_all_in_one(pdf_path):
         insurer_code = _detect_insurer_from_text(combined_3)
 
         # 상품명 추출 (PyMuPDF 텍스트로 — 줄 분리가 달라도 정규식 동작)
-        product_name = _detect_product_name_from_text(page_texts_fast[:3])
+        product_name = _detect_product_name_from_text(page_texts_fast[:10])
 
         # 보험료 추출 (PyMuPDF 텍스트로)
-        premium = _extract_premium_from_texts(page_texts_fast[:7])
+        premium = _extract_premium_from_texts(page_texts_fast[:10])
 
         # 보험사별로 pdfplumber에서 필요한 페이지 결정
-        # 텍스트 기반 파서는 pdfplumber 텍스트 필요, 테이블 기반은 키워드 페이지 테이블만
         needs_pdfplumber_text = set()
         if insurer_code == "samsung_life":
-            # 삼성생명: 페이지 4~7 (인덱스 기준) 텍스트 필요
             for pg in range(4, min(8, len(page_texts_fast))):
                 needs_pdfplumber_text.add(pg)
         elif insurer_code == "kb":
-            # KB: 처음 10페이지 텍스트 필요
             for pg in range(min(10, len(page_texts_fast))):
                 needs_pdfplumber_text.add(pg)
         elif insurer_code == "mirae":
-            # 미래에셋: 별도 함수에서 PDF를 다시 열므로 여기선 불필요
             pass
         elif insurer_code == "heungkuk":
-            # 흥국생명: 테이블 + 텍스트 보완 필요 → 키워드 페이지 텍스트 추출
+            # 흥국생명: 보장 테이블 페이지만 (최대 15페이지까지만 탐색)
             for pg in sorted(keyword_page_set):
-                needs_pdfplumber_text.add(pg)
-        # 범용(메리츠 등): 테이블만 필요 → pdfplumber 텍스트 불필요
+                if pg < 15:
+                    needs_pdfplumber_text.add(pg)
 
-        # pdfplumber 열기 — 필요한 페이지만 처리
-        pages_to_process = keyword_page_set | needs_pdfplumber_text
+        # 키워드 페이지도 최대 20페이지까지만 테이블 추출 (뒷 페이지는 약관)
+        limited_keyword_set = {p for p in keyword_page_set if p < 20}
+
+        pages_to_process = limited_keyword_set | needs_pdfplumber_text
         if pages_to_process:
             with pdfplumber.open(pdf_path) as pdf:
-                # page_texts를 전체 길이로 초기화 (빈 문자열)
                 page_texts = [""] * len(pdf.pages)
                 for i in sorted(pages_to_process):
                     if i >= len(pdf.pages):
                         continue
                     page = pdf.pages[i]
 
-                    # 텍스트 추출 (텍스트 기반 파서에 필요한 페이지만)
                     if i in needs_pdfplumber_text:
                         text = page.extract_text()
                         page_texts[i] = text or ""
 
-                    # 테이블 추출 (키워드 페이지만)
-                    if i in keyword_page_set:
+                    if i in limited_keyword_set:
                         tables = page.extract_tables({
                             'vertical_strategy': 'lines',
                             'horizontal_strategy': 'lines',
@@ -1230,10 +1159,12 @@ def parse_pdf_all_in_one(pdf_path):
             page_texts = [""] * len(page_texts_fast)
 
     else:
-        # PyMuPDF 없으면 기존 pdfplumber 전체 처리
+        # PyMuPDF 없거나 hang → pdfplumber 전체 처리 (최대 20페이지)
         keyword_page_set = set()
         with pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages):
+            max_pages = min(len(pdf.pages), 20)  # 보장 테이블은 보통 앞 20페이지 안에 있음
+            for i in range(max_pages):
+                page = pdf.pages[i]
                 text = page.extract_text()
                 page_texts.append(text or "")
                 if text and any(kw in text for kw in coverage_keywords):
@@ -1254,8 +1185,8 @@ def parse_pdf_all_in_one(pdf_path):
 
         combined_3 = "\n".join(page_texts[:3])
         insurer_code = _detect_insurer_from_text(combined_3)
-        product_name = _detect_product_name_from_text(page_texts[:3])
-        premium = _extract_premium_from_texts(page_texts[:7])
+        product_name = _detect_product_name_from_text(page_texts[:10])
+        premium = _extract_premium_from_texts(page_texts[:10])
 
     # ── 특약 추출 (보험사별 분기) ──
     if insurer_code == "samsung_life":
@@ -1268,14 +1199,14 @@ def parse_pdf_all_in_one(pdf_path):
             page_texts if any(page_texts) else page_texts_fast, pdf_path
         )
     elif insurer_code == "heungkuk":
-        # 흥국생명 전용 파서 — 테이블 + 텍스트 하이브리드
+        # 흥국생명 전용 파서 — 테이블 기반 (실제 PDF 구조에 맞춤)
         coverages = _extract_coverage_heungkuk_from_cache(
             page_texts if any(page_texts) else page_texts_fast,
             page_tables, pdf_path
         )
-        # 캐시 결과 없으면 전체 PDF 재오픈 파서 시도
+        # 캐시 결과 없으면 pdfplumber로 페이지 5~14만 처리 (전체 PDF 재오픈 금지)
         if not coverages:
-            coverages = extract_coverage_heungkuk(pdf_path)
+            coverages = _extract_coverage_heungkuk_limited(pdf_path)
     else:
         # 범용 파서 — 테이블 캐시 사용 (PDF 재오픈 안 함)
         coverages = _extract_coverage_generic_from_cache(page_texts, page_tables, pdf_path)
@@ -1338,6 +1269,15 @@ def _detect_product_name_from_text(page_texts):
         for line in text.split('\n'):
             line = line.strip()
 
+            # 보험상품명 라벨이 있는 줄 (흥국생명 등)
+            product_label_match = re.search(r'보험상품명\s+(.+)', line)
+            if product_label_match:
+                name = product_label_match.group(1).strip()
+                # (무) 접두사 제거
+                name = re.sub(r'^\(무\)\s*', '', name).strip()
+                if len(name) > 4:
+                    return name[:50] if len(name) > 50 else name
+
             kb_match = re.search(r'(KB\s*플러스\s*[^\(\n]+보험)', line)
             if kb_match:
                 name = kb_match.group(1).strip()
@@ -1356,10 +1296,11 @@ def _detect_product_name_from_text(page_texts):
 
             if re.match(r'^\(무\)|^\(유\)', line):
                 name = re.sub(r'^\(무\)\s*|^\(유\)\s*', '', line)
-                match = re.match(r'^([^(]+)', name)
-                if match:
-                    name = match.group(1).strip()
-                return name[:30] if len(name) > 30 else name
+                # 상품명에 '보험' 포함 필수 (표지의 짧은 줄 제외)
+                if '보험' in name:
+                    name = name.strip()
+                    return name[:50] if len(name) > 50 else name
+                # '보험' 없으면 스킵 (표지 줄일 수 있음)
 
             samsung_match = re.match(r'^삼성\s+(.+보험)', line)
             if samsung_match:

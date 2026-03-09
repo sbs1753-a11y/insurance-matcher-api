@@ -98,6 +98,9 @@ def get_surgery_grade_amounts(pdf_coverages):
                 f"_{grade}종 수술",
                 f"_{grade}종수술보험금",
                 f"_{grade}종 수술보험금",
+                # 흥국생명: 1~5종질병수술(분리형,1종) 또는 1~5종재해수술
+                f"분리형,{grade}종)",
+                f",{grade}종)",
             ]
             matched = False
             for pattern in patterns:
@@ -132,6 +135,9 @@ def get_aggregated_amounts(pdf_coverages):
             disease_surgery += amount
         elif "질병재해수술" in key:
             disease_surgery += amount
+        # 흥국생명: (무)질병수술(체증형) → 질병수술비
+        elif "질병수술(체증형)" in key or "질병수술(체증" in key:
+            disease_surgery += amount
     if disease_surgery > 0:
         result["질병수술비"] = disease_surgery
 
@@ -141,6 +147,9 @@ def get_aggregated_amounts(pdf_coverages):
             result["상해수술비"] = amount
             break
         elif "질병재해수술" in key and "상해수술비" not in result:
+            result["상해수술비"] = amount
+        # 흥국생명: (무)재해수술보장 → 상해수술비
+        elif "재해수술보장" in key and "상해수술비" not in result:
             result["상해수술비"] = amount
 
     # 뇌혈관질환 수술비
@@ -186,15 +195,69 @@ def get_aggregated_amounts(pdf_coverages):
 
     # 허혈성심장질환 진단비
     for key, amount in simplified.items():
-        if "허혈성심장질환진단" in key and "수술" not in key:
+        if ("허혈성심장질환진단" in key or "허혈심장질환진단" in key) and "수술" not in key:
             result["허혈성심장질환진단비"] = amount
             break
 
+    # 항암방사선약물치료비 (항암약물치료 + 항암방사선치료 합산)
+    antineoplastic_total = 0
+    for key, amount in simplified.items():
+        key_lower = key.lower()
+        # 직접 합산 항목들
+        if ("항암약물치료비" in key or "항암방사선약물치료비" in key):
+            antineoplastic_total = amount
+            break
+        # 흥국생명: (무)항암약물치료 + (무)항암방사선치료 합산
+        if "항암약물치료" in key and "방사선" not in key and "소액암" not in key and "호르몬" not in key and "통합" not in key and "세기조절" not in key and "양성자" not in key and "중입자" not in key and "표적" not in key and "카티" not in key:
+            antineoplastic_total += amount
+        elif "항암방사선치료" in key and "소액암" not in key and "세기조절" not in key and "양성자" not in key and "중입자" not in key and "통합" not in key:
+            antineoplastic_total += amount
+    if antineoplastic_total > 0:
+        result["항암방사선약물치료비"] = antineoplastic_total
+
     # 일반상해사망 / 재해사망
+    death_amount = 0
     for key, amount in simplified.items():
         if any(kw in key for kw in ["일반상해사망", "재해사망", "주보험재해사망", "주계약(재해사망)"]):
-            result["일반상해사망"] = amount
+            death_amount = amount
             break
+    if death_amount > 0:
+        result["일반상해사망"] = death_amount
+    # 흥국생명: (무)재해사망 → 일반상해사망에 주계약 가입금액 합산
+    for cov in pdf_coverages:
+        name = simplify_pdf_name(cov["특약명"])
+        if "재해사망" in name and "일반상해사망" not in result:
+            result["일반상해사망"] = cov["가입금액"]
+            break
+
+    # 일반사망 (주계약 사망보험금)
+    # 흥국생명: 주계약 가입금액의 50% (재해 이외 원인으로 사망시)
+    for cov in pdf_coverages:
+        name = cov["특약명"]
+        if "통합보험" in name or "주계약" in name.lower():
+            # 주계약 가입금액 = 일반사망
+            result["일반사망"] = cov["가입금액"] // 2  # 50%
+            break
+    # 별도 일반사망보장/종신사망 특약 우선
+    for key, amount in simplified.items():
+        if any(kw in key for kw in ["일반사망보장", "종신사망", "사망보장"]):
+            result["일반사망"] = amount
+            break
+
+    # 상해사망/재해사망 합산 (주계약 재해사망 + 재해사망 특약)
+    total_death = 0
+    for cov in pdf_coverages:
+        name = simplify_pdf_name(cov["특약명"])
+        if "재해사망" in name:
+            total_death += cov["가입금액"]
+    # 주계약에 재해사망 100% 포함시
+    for cov in pdf_coverages:
+        name = cov["특약명"]
+        if "통합보험" in name or "주계약" in name.lower():
+            total_death += cov["가입금액"]  # 재해 원인 100%
+            break
+    if total_death > 0:
+        result["상해사망/재해사망"] = total_death
 
     # 가족일상배상책임
     for key, amount in simplified.items():
@@ -250,17 +313,16 @@ MATCHING_RULES = {
     # 암
     "암진단(일반암)": {"type": "direct", "keywords": [
         "암진단비", "일반암진단비", "암(유사암제외)진단비",
-        "암(유사암제외)진단", "암(유사암제외)"
+        "암(유사암제외)진단", "암(유사암제외)",
+        "암진단"  # 흥국생명: (무)암진단(갱신형)Ⅴ
     ]},
     "소액/유사암": {"type": "direct", "keywords": [
-        "유사암진단비", "소액암진단비", "유사암진단"
+        "유사암진단비", "소액암진단비", "유사암진단",
+        "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
     ]},
     "전이암진단비": {"type": "direct", "keywords": ["전이암진단비"]},
     "암주요치료비": {"type": "direct", "keywords": ["암주요치료비"]},
-    "항암방사선약물치료비": {"type": "direct", "keywords": [
-        "항암방사선약물치료비", "항암약물치료비",
-        "항암방사선치료", "항암약물치료"
-    ]},
+    "항암방사선약물치료비": {"type": "aggregate", "key": "항암방사선약물치료비"},
     "표적항암약물치료비": {"type": "direct", "keywords": [
         "표적항암약물치료비", "표적항암약물허가치료"
     ]},
@@ -272,9 +334,12 @@ MATCHING_RULES = {
     ]},
     "면역항암약물치료비": {"type": "direct", "keywords": [
         "면역항암약물치료비", "특정면역항암약물허가치료",
-        "면역항암약물허가치료", "특정면역항암"
+        "면역항암약물허가치료", "특정면역항암",
+        "카티항암약물허가치료"  # 흥국생명: 카티(CAR-T) = 면역항암약물치료
     ]},
-    "카티항암약물치료비": {"type": "direct", "keywords": ["카티항암약물치료비", "CAR-T"]},
+    "카티항암약물치료비": {"type": "direct", "keywords": [
+        "카티항암약물치료비", "카티항암약물허가치료", "CAR-T"
+    ]},
     "다빈치로봇수술비": {"type": "direct", "keywords": [
         "다빈치로봇수술비", "다빈치로봇수술",
         "암다빈치로봇수술"
@@ -291,8 +356,12 @@ MATCHING_RULES = {
     "뇌출혈": {"type": "direct", "keywords": ["뇌출혈진단비"]},
 
     # 심장
-    "심혈관질환진단비": {"type": "direct", "keywords": ["심혈관질환진단비"]},
-    "심혈관질환": {"type": "direct", "keywords": ["심혈관질환진단비"]},
+    "심혈관질환진단비": {"type": "direct", "keywords": [
+        "심혈관질환진단비", "기타부정맥진단"  # 흥국생명: 기타부정맥진단
+    ]},
+    "심혈관질환": {"type": "direct", "keywords": [
+        "심혈관질환진단비", "기타부정맥진단"  # 흥국생명: 기타부정맥진단
+    ]},
     "허혈성심장질환진단비": {"type": "aggregate", "key": "허혈성심장질환진단비"},
     "허혈성심장질환": {"type": "aggregate", "key": "허혈성심장질환진단비"},
     "허혈성심장질환수술비": {"type": "aggregate", "key": "허혈성심장질환수술비"},
@@ -306,14 +375,23 @@ MATCHING_RULES = {
     "응급실내원(비응급)": {"type": "direct", "keywords": ["응급실내원(비응급)"]},
 
     # 사망
-    "일반사망": {"type": "direct", "keywords": ["일반사망보장", "종신사망", "사망보장"]},
+    "일반사망": {"type": "special_general_death"},  # 특수 처리: 주계약 사망보험금
     "질병사망": {"type": "direct", "keywords": ["질병사망"]},
-    "상해사망/재해사망": {"type": "aggregate", "key": "일반상해사망"},
+    "상해사망/재해사망": {"type": "aggregate", "key": "상해사망/재해사망"},
 
     # 후유장해
-    "상해후유장해3%": {"type": "direct", "keywords": ["상해3%이상후유장해", "상해후유장해3%"]},
-    "질병후유장해3%": {"type": "direct", "keywords": ["질병3%이상후유장해", "질병후유장해3%"]},
-    "상해후유장해": {"type": "direct", "keywords": ["상해후유장해", "일반상해80%이상후유장해"]},
+    "상해후유장해3%": {"type": "direct", "keywords": [
+        "상해3%이상후유장해", "상해후유장해3%",
+        "재해후유장해보장", "재해후유장해"  # 흥국생명: 재해후유장해보장
+    ]},
+    "질병후유장해3%": {"type": "direct", "keywords": [
+        "질병3%이상후유장해", "질병후유장해3%",
+        "질병후유장해보장", "질병후유장해"  # 흥국생명: 질병후유장해보장
+    ]},
+    "상해후유장해": {"type": "direct", "keywords": [
+        "상해후유장해", "일반상해80%이상후유장해",
+        "재해후유장해보장", "재해후유장해"
+    ]},
     "질병후유장해": {"type": "direct", "keywords": ["질병후유장해", "질병80%이상후유장해"]},
 
     # 골절
@@ -375,6 +453,23 @@ def match_coverages(pdf_coverages, excel_coverages, threshold=70):
                 if key in aggregated:
                     matched_amount = aggregated[key]
                     matched_pdf_name = f"[합산] {key}"
+
+            elif rule_type == "special_general_death":
+                # 일반사망: aggregated에서 찾기
+                if "일반사망" in aggregated:
+                    matched_amount = aggregated["일반사망"]
+                    matched_pdf_name = "[합산] 일반사망"
+                else:
+                    # 직접 매칭 시도
+                    for kw in ["일반사망보장", "종신사망", "사망보장"]:
+                        kw_clean = re.sub(r'\s+', '', kw)
+                        for pdf_key, pdf_cov in pdf_simplified.items():
+                            if kw_clean in pdf_key:
+                                matched_amount = pdf_cov["가입금액"]
+                                matched_pdf_name = pdf_cov["특약명"]
+                                break
+                        if matched_amount:
+                            break
 
             elif rule_type == "surgery_grade":
                 grade = rule["grade"]
