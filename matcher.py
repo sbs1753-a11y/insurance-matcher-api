@@ -160,10 +160,21 @@ def get_aggregated_amounts(pdf_coverages):
     result = {}
 
     # 질병수술비
+    # 삼성화재: "질병 입원 수술비Ⅱ" 30만원만 해당 (111대질병, 2대주요기관, 상급종합, 1~5종 등은 별도 항목)
+    # 흥국생명: (무)질병수술(체증형)
+    # 미래에셋: 질병수술무배당
     disease_surgery = 0
+    # 제외 키워드: 삼성화재의 특수 수술 분류는 질병수술비에 포함하지 않음
+    disease_surgery_exclude = [
+        "130대", "5대질환", "111대", "2대주요기관", "상급종합병원",
+        "1~5종", "1-5종", "충수염", "4대특정", "양성신생물",
+        "통합양성", "관혈", "비관혈", "통원", "백내장",
+        "다빈치", "스텐트", "풍선", "창상봉합",
+    ]
     for key, amount in simplified.items():
-        if "질병수술비" in key and "130대" not in key and "5대질환" not in key:
-            disease_surgery += amount
+        if "질병수술비" in key:
+            if not any(ex in key for ex in disease_surgery_exclude):
+                disease_surgery += amount
         elif "질병재해수술" in key:
             disease_surgery += amount
         # 흥국생명: (무)질병수술(체증형) → 질병수술비
@@ -172,24 +183,34 @@ def get_aggregated_amounts(pdf_coverages):
         # 미래에셋: 질병수술무배당 (백내장 제외 아닌 순수 질병수술)
         elif re.match(r'^질병수술[무배당최초]', key) and "백내장" not in key:
             disease_surgery += amount
+        # 삼성화재: "질병입원수술비" or "질병통원수술비" (Ⅱ/Ⅳ) → 질병수술비 (입원+통원 중 입원만)
+        elif re.match(r'^질병입원수술비', key) and "백내장" not in key:
+            disease_surgery += amount
     if disease_surgery > 0:
         result["질병수술비"] = disease_surgery
 
     # 상해수술비
+    injury_surgery = 0
     for key, amount in simplified.items():
         if key == "상해수술비":
-            result["상해수술비"] = amount
+            injury_surgery = amount
             break
-        elif "질병재해수술" in key and "상해수술비" not in result:
-            result["상해수술비"] = amount
+        elif "질병재해수술" in key and injury_surgery == 0:
+            injury_surgery = amount
         # 흥국생명: (무)재해수술보장 → 상해수술비
-        elif "재해수술보장" in key and "상해수술비" not in result:
-            result["상해수술비"] = amount
+        elif "재해수술보장" in key and injury_surgery == 0:
+            injury_surgery = amount
         # 미래에셋: 재해수술무배당 → 상해수술비
-        elif re.match(r'^재해수술[무배당최초]', key) and "상해수술비" not in result:
-            result["상해수술비"] = amount
+        elif re.match(r'^재해수술[무배당최초]', key) and injury_surgery == 0:
+            injury_surgery = amount
+        # 삼성화재: "상해입원수술비(당일입원제외)" → 상해수술비
+        elif re.match(r'^상해입원수술비', key) and injury_surgery == 0:
+            injury_surgery = amount
+    if injury_surgery > 0:
+        result["상해수술비"] = injury_surgery
 
     # 뇌혈관질환 수술비
+    # 삼성화재: 2대주요기관질병 관혈수술비 + 비관혈수술비 = 1500 (뇌+심장 공통)
     brain_surgery = 0
     for key, amount in simplified.items():
         if "뇌혈관질환수술비" in key and "130대" not in key:
@@ -199,6 +220,13 @@ def get_aggregated_amounts(pdf_coverages):
         # 미래에셋: 뇌혈관질환수술(최초1회한) → 뇌혈관질환수술비
         elif "뇌혈관질환수술" in key and "130대" not in key:
             brain_surgery += amount
+    # 삼성화재: "2대주요기관질병 관혈수술비" + "비관혈수술비" (뇌+심장 공통)
+    major_organ_surgery = 0
+    for key, amount in simplified.items():
+        if "2대주요기관질병" in key and ("관혈수술" in key or "비관혈수술" in key):
+            major_organ_surgery += amount
+    if major_organ_surgery > 0 and brain_surgery == 0:
+        brain_surgery = major_organ_surgery
     if brain_surgery > 0:
         result["뇌혈수술비"] = brain_surgery
         result["뇌혈관질환수술비"] = brain_surgery
@@ -213,6 +241,9 @@ def get_aggregated_amounts(pdf_coverages):
         # 미래에셋: 허혈성심장질환수술(최초1회한) → 허혈성심장질환수술비
         elif "허혈성심장질환수술" in key and "130대" not in key:
             heart_surgery += amount
+    # 삼성화재: "2대주요기관질병 관혈수술비" + "비관혈수술비" (뇌+심장 공통)
+    if major_organ_surgery > 0 and heart_surgery == 0:
+        heart_surgery = major_organ_surgery
     if heart_surgery > 0:
         result["허혈성심장질환수술비"] = heart_surgery
 
@@ -230,17 +261,21 @@ def get_aggregated_amounts(pdf_coverages):
             result["골절수술비"] = amount
             break
 
-    # 뇌혈관질환 진단비
+    # 뇌혈관질환 진단비 (삼성화재: 뇌혈관질환 진단비 + 뇌혈관질환(90일면책) 진단비 합산)
+    brain_diag = 0
     for key, amount in simplified.items():
-        if "뇌혈관질환진단" in key and "수술" not in key:
-            result["뇌혈관질환진단비"] = amount
-            break
+        if "뇌혈관질환" in key and "진단" in key and "수술" not in key:
+            brain_diag += amount
+    if brain_diag > 0:
+        result["뇌혈관질환진단비"] = brain_diag
 
-    # 허혈성심장질환 진단비
+    # 허혈성심장질환 진단비 (삼성화재: 허혈성심장질환 + 90일면책 합산)
+    heart_diag = 0
     for key, amount in simplified.items():
-        if ("허혈성심장질환진단" in key or "허혈심장질환진단" in key) and "수술" not in key:
-            result["허혈성심장질환진단비"] = amount
-            break
+        if ("허혈성심장질환" in key or "허혈심장질환" in key) and "진단" in key and "수술" not in key:
+            heart_diag += amount
+    if heart_diag > 0:
+        result["허혈성심장질환진단비"] = heart_diag
 
     # 항암방사선약물치료비
     # ─────────────────────────────────────────────────────────
@@ -312,6 +347,12 @@ def get_aggregated_amounts(pdf_coverages):
         if "재해사망" in name and "일반상해사망" not in result:
             result["일반상해사망"] = cov["가입금액"]
             break
+    # 삼성화재: "상해 사망" 5000만원 = 상해사망/재해사망에 해당
+    if "일반상해사망" not in result:
+        for key, amount in simplified.items():
+            if key == "상해사망":
+                result["일반상해사망"] = amount
+                break
 
     # 일반사망 (주계약 사망보험금)
     # 흥국생명: 주계약 가입금액의 50% (재해 이외 원인으로 사망시)
@@ -342,6 +383,12 @@ def get_aggregated_amounts(pdf_coverages):
             name = cov["특약명"]
             if "통합보험" in name:
                 total_death += cov["가입금액"]  # 재해 원인 100%
+                break
+    # 삼성화재: "상해 사망" = 상해사망/재해사망
+    if total_death == 0:
+        for key, amount in simplified.items():
+            if key == "상해사망":
+                total_death = amount
                 break
     if total_death > 0:
         result["상해사망/재해사망"] = total_death
@@ -411,8 +458,10 @@ MATCHING_RULES = {
     "전이암진단비": {"type": "direct", "keywords": ["전이암진단비", "전이암진단"]},
     "암주요치료비": {"type": "direct_exclude", "keywords": [
         "암주요치료비",
-        "일반암주요치료"  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
-    ], "exclude": ["소액암"]},
+        "일반암주요치료",  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
+        "암전액본인부담",  # 삼성화재: 종합병원 암 전액본인부담(비급여포함) 통합치료비
+        "암통합치료비",  # 삼성화재: 통합치료비(실속형)
+    ], "exclude": ["소액암", "유사암", "전이암"]},
     "항암방사선약물치료비": {"type": "aggregate", "key": "항암방사선약물치료비"},
     "표적항암약물치료비": {"type": "direct", "keywords": [
         "표적항암약물치료비", "표적항암약물허가치료"
@@ -445,8 +494,8 @@ MATCHING_RULES = {
     "뇌혈관질환수술비": {"type": "aggregate", "key": "뇌혈관질환수술비"},
     "뇌졸증진단비": {"type": "direct", "keywords": ["뇌졸중진단비", "뇌졸증진단비"]},
     "뇌졸증": {"type": "direct", "keywords": ["뇌졸중진단비", "뇌졸증진단비"]},
-    "뇌출혈진단비": {"type": "direct", "keywords": ["뇌출혈진단비"]},
-    "뇌출혈": {"type": "direct", "keywords": ["뇌출혈진단비"]},
+    "뇌출혈진단비": {"type": "direct_exclude", "keywords": ["뇌출혈진단비"], "exclude": ["외상성"]},
+    "뇌출혈": {"type": "direct_exclude", "keywords": ["뇌출혈진단비"], "exclude": ["외상성"]},
 
     # 심장
     "심혈관질환진단비": {"type": "direct", "keywords": [
@@ -464,8 +513,8 @@ MATCHING_RULES = {
     "급성심근경색": {"type": "direct", "keywords": ["급성심근경색진단비", "급성심근경색증진단비"]},
 
     # 입원/응급
-    "질병입원": {"type": "direct_exclude", "keywords": ["질병입원"], "exclude": ["다빈도", "특정"]},
-    "상해입원": {"type": "direct", "keywords": ["상해입원"]},
+    "질병입원": {"type": "direct_exclude", "keywords": ["질병입원일당", "질병입원비"], "exclude": ["다빈도", "특정", "수술"]},
+    "상해입원": {"type": "direct_exclude", "keywords": ["상해입원일당", "상해입원비"], "exclude": ["수술"]},
     "응급실내원(응급)": {"type": "direct", "keywords": [
         "응급실내원(응급)", "응급실내원"  # 미래에셋: 응급실내원특약 (응급/비응급 구분 없음)
     ]},
