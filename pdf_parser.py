@@ -1430,6 +1430,13 @@ def _detect_product_name_from_text(page_texts):
                     return name[:50] if len(name) > 50 else name
                 # '보험' 없으면 스킵 (표지 줄일 수 있음)
 
+            # 삼성화재: "무배당삼성화재 건강보험 천만안심(2601.13)..." 패턴
+            samsung_match2 = re.search(r'(?:무배당)?삼성화재\s+(.+?)(?:\([\d.]+\))', line)
+            if samsung_match2:
+                name = samsung_match2.group(1).strip()
+                return name[:30] if len(name) > 30 else name
+
+            # 삼성: "삼성 뉴골드보험(무배당)" 패턴 (레거시)
             samsung_match = re.match(r'^삼성\s+(.+보험)', line)
             if samsung_match:
                 name = samsung_match.group(1).strip()
