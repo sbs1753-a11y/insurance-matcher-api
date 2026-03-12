@@ -1449,6 +1449,15 @@ def _detect_product_name_from_text(page_texts):
                 name = re.sub(r'\(무배당\).*', '', name).strip()
                 return name[:30] if len(name) > 30 else name
 
+            # 현대해상: "무배당현대해상퍼펙트플러스종합보험(연만기갱신형)(Hi2601)" 패턴
+            hyundai_match = re.search(r'(?:무배당)?현대해상(.+?종합보험|.+?보험)(?:\([^)]*\))', line)
+            if hyundai_match:
+                name = hyundai_match.group(1).strip()
+                # "보험" 등 접미사 제거하고 핵심 상품명만 추출
+                name = re.sub(r'종합보험$|보험$', '', name).strip()
+                if len(name) >= 2:
+                    return name[:30] if len(name) > 30 else name
+
             # 흥국생명 상품명 감지
             # 1) "(무)흥국 XXX보험" 또는 "무배당 흥국 XXX보험" 패턴 (상품명 확실)
             heungkuk_product = re.search(r'(?:\(무\)\s*|\(무배당\)\s*|무배당\s+)(흥국\s*[^\(\n]*보험[^\(\n]*)', line)
@@ -1631,10 +1640,17 @@ def _extract_coverage_generic_from_cache(page_texts, page_tables, pdf_path):
                         continue
                     cell_clean = cell.replace(" ", "").replace("\n", "")
                     if any(kw in cell_clean for kw in header_keywords):
-                        header_idx = idx
+                        if amount_col is None:
+                            # header 키워드 찾았지만 amount_col 아직 없으면 후보만 기록
+                            header_idx = idx
+                        else:
+                            header_idx = idx
                     if any(kw in cell_clean for kw in amount_keywords):
                         amount_col = j
-                if header_idx is not None:
+                        if header_idx is None:
+                            header_idx = idx
+                # header와 amount 모두 찾으면 중단
+                if header_idx is not None and amount_col is not None:
                     break
 
             if header_idx is None or amount_col is None:
@@ -1758,10 +1774,15 @@ def extract_coverage_generic(pdf_path):
                             continue
                         cell_clean = cell.replace(" ", "").replace("\n", "")
                         if any(kw in cell_clean for kw in header_keywords):
-                            header_idx = idx
+                            if amount_col is None:
+                                header_idx = idx
+                            else:
+                                header_idx = idx
                         if any(kw in cell_clean for kw in amount_keywords):
                             amount_col = j
-                    if header_idx is not None:
+                            if header_idx is None:
+                                header_idx = idx
+                    if header_idx is not None and amount_col is not None:
                         break
 
                 if header_idx is None or amount_col is None:
