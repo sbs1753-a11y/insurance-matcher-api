@@ -71,9 +71,21 @@ def simplify_pdf_name(name):
     name = re.sub(r'\(수술회당지급\)', '', name)
     name = re.sub(r'무배당', '', name)
 
+    # 신한라이프 정리
+    name = re.sub(r'\(무배당,\s*갱신형\)', '', name)
+    name = re.sub(r',\s*갱신형\)', ')', name)
+    name = re.sub(r'\[삭감없음용\]', '', name)
+    name = re.sub(r'\[3-100%장해형\]', '', name)
+    name = re.sub(r'비급여\(전액본인부담\s*포함\)', '', name)
+    name = re.sub(r'\(치료별\s*연간\d*회?\)', '', name)
+    name = re.sub(r'\(4대중증치료\)', '', name)
+    name = re.sub(r'\(갑상선암및전립선암\s*제외\)', '', name)
+    name = re.sub(r'\(갑상선암및전립선암\s*포함\)', '', name)
+
     # 공통 정리
     name = re.sub(r'\s+', '', name)
-    name = re.sub(r'\(\s*\)', '', name)
+    name = re.sub(r'\(\s*,?\s*\)', '', name)  # (,) 빈 괄호 제거
+    name = re.sub(r'\(\s*\)', '', name)  # () 빈 괄호 제거
     name = name.strip()
     return name
 
@@ -286,7 +298,8 @@ def get_aggregated_amounts(pdf_coverages):
     fracture_diag_exclude = ["5대골절", "부목", "철심"]
     for cov in pdf_coverages:
         key = simplify_pdf_name(cov["특약명"])
-        if "골절" in key and "진단" in key and "수술" not in key:
+        if ("골절" in key and "진단" in key and "수술" not in key) or \
+           ("재해골절치료" in key):
             if not any(ex in key for ex in fracture_diag_exclude):
                 fracture_diag += cov["가입금액"]
     if fracture_diag > 0:
@@ -486,6 +499,35 @@ def get_aggregated_amounts(pdf_coverages):
                 result["가족일상배상책임"] = amount
                 break
 
+    # 상해후유장해3% (합산)
+    # 신한라이프: 재해장해특약 7000만원 + 주계약(신한통합건강보험) 500만원 = 7500만원
+    # 다른 보험사: 단일 특약이면 그 금액만 사용
+    injury_disability = 0
+    for key, amount in simplified.items():
+        if any(kw in key for kw in [
+            "상해3%이상후유장해", "상해후유장해3%",
+            "재해후유장해보장", "재해후유장해",
+        ]):
+            injury_disability = amount
+            break
+        elif "기본계약(상해후유장해" in key:
+            injury_disability = amount
+            break
+    # 신한라이프/미래에셋: 재해장해 (simplified 이름) - 부분 일치 (미래에셋: "재해장해최초계")
+    if injury_disability == 0:
+        for key, amount in simplified.items():
+            if "재해장해" in key and "수술" not in key and "사망" not in key:
+                injury_disability = amount
+                break
+    # 신한라이프: 주계약도 장해급여금 포함 (재해장해특약 + 주계약)
+    if injury_disability > 0:
+        for key, amount in simplified.items():
+            if "신한통합건강보험" in key or "통합건강보험" in key:
+                injury_disability += amount
+                break
+    if injury_disability > 0:
+        result["상해후유장해3%"] = injury_disability
+
     # 교통사고처리지원금 (중상해보장확대만 — 6주미만 제외)
     for cov in pdf_coverages:
         original_name = cov["특약명"]
@@ -539,6 +581,7 @@ MATCHING_RULES = {
     ]},
     "소액/유사암": {"type": "direct_exclude", "keywords": [
         "유사암진단비", "소액암진단비", "유사암진단",
+        "소액암진단",  # 신한라이프: 소액암진단특약 → simplified "소액암진단"
         "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
     ], "exclude": ["제외"]},  # "암(유사암제외)진단" 제외
     "전이암진단비": {"type": "direct", "keywords": ["전이암진단비", "전이암진단"]},
@@ -633,16 +676,12 @@ MATCHING_RULES = {
     "상해사망/재해사망": {"type": "aggregate", "key": "상해사망/재해사망"},
 
     # 후유장해
-    "상해후유장해3%": {"type": "direct", "keywords": [
-        "상해3%이상후유장해", "상해후유장해3%",
-        "재해후유장해보장", "재해후유장해",  # 흥국생명: 재해후유장해보장
-        "재해장해",  # 미래에셋: 재해장해보장특약
-        "기본계약(상해후유장해",  # 현대해상: 기본계약(상해후유장해)
-    ]},
+    # 신한라이프: 재해장해특약 7000만원 + 주계약(신한통합건강보험) 500만원 = 7500만원
+    "상해후유장해3%": {"type": "aggregate", "key": "상해후유장해3%"},
     "질병후유장해3%": {"type": "direct", "keywords": [
         "질병3%이상후유장해", "질병후유장해3%",
         "질병후유장해보장", "질병후유장해",  # 흥국생명: 질병후유장해보장
-        "질병장해"  # 미래에셋: 질병장해보장특약
+        "질병장해"  # 미래에셋/신한라이프: 질병장해보장특약
     ]},
     "상해후유장해": {"type": "direct", "keywords": [
         "상해후유장해", "일반상해80%이상후유장해",

@@ -1193,6 +1193,107 @@ def _parse_heungkuk_text(text):
 
 
 # ══════════════════════════════════════════════
+# 신한라이프 전용 파서 (PyMuPDF 텍스트 기반)
+# ══════════════════════════════════════════════
+
+def extract_coverage_shinhan(page_texts_fast):
+    """신한라이프 PDF 파싱 — PyMuPDF 텍스트 기반
+    
+    신한라이프 PDF 구조:
+      [번호] 특약명\n가입금액\n대표지급금액\n보험기간\n납입기간\n보험료
+    
+    핵심: 신한라이프는 "대표지급금액"을 사용해야 함.
+    가입금액과 대표지급금액이 다른 경우가 많음.
+    예: 항암방사선치료특약 가입금액 30,000만원, 대표지급금액 3,000만원
+        → 정답은 3,000만원 (대표지급금액)
+    """
+    results = []
+    found_premium_total = False
+    
+    for text in page_texts_fast:
+        if not text:
+            continue
+        # 보험료 합계가 나오면 특약 목록 종료
+        if found_premium_total:
+            break
+        # 특약 목록이 있는 페이지만 처리 (가입금액+대표지급금액 헤더 or [번호] 패턴)
+        if '가입금액' not in text or '대표지급금액' not in text:
+            if '[1]' not in text and '[2]' not in text:
+                continue
+        
+        if '보험료 합계' in text or '보험료합계' in text.replace(' ', ''):
+            found_premium_total = True
+        
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            # [번호] 또는 [번호-번호] 로 시작하는 줄 = 특약 시작
+            match = re.match(r'^\[(\d+(?:-\d+)?)\]\s*(.*)', line)
+            if match:
+                num = match.group(1)
+                name_part = match.group(2).strip()
+                
+                # 다음 줄에 특약명이 이어질 수 있음 (줄바꿈된 경우)
+                j = i + 1
+                while j < len(lines):
+                    next_line = lines[j].strip()
+                    # 금액 줄이 나오면 중단
+                    if re.search(r'[\d,]+만원', next_line):
+                        break
+                    # 다른 특약 시작이면 중단
+                    if re.match(r'^\[', next_line):
+                        break
+                    # 헤더/빈줄이면 중단
+                    if not next_line or next_line in ['상품명', '가입금액', '대표지급금액', '보험기간', '납입기간', '보험료']:
+                        break
+                    # 특약명 연속 (예: "제외)" 등)
+                    name_part += " " + next_line
+                    j += 1
+                
+                # 가입금액과 대표지급금액 찾기
+                amounts = []
+                while j < len(lines) and len(amounts) < 2:
+                    l = lines[j].strip()
+                    amt_match = re.search(r'([\d,]+)만원', l)
+                    if amt_match:
+                        amounts.append(int(amt_match.group(1).replace(',', '')))
+                    elif re.match(r'^\[', l):
+                        break
+                    # 보험기간/납입기간 등이 나오면 더 이상 금액 없음
+                    elif re.match(r'^\d+년갱신|^\d+년납|^\(최대', l):
+                        break
+                    j += 1
+                
+                if len(amounts) >= 2:
+                    # 가입금액[0], 대표지급금액[1] → 대표지급금액 사용
+                    representative_amount = amounts[1] * 10000  # 만원 → 원
+                    results.append({
+                        "특약명": name_part.strip(),
+                        "가입금액": representative_amount
+                    })
+                elif len(amounts) == 1:
+                    results.append({
+                        "특약명": name_part.strip(),
+                        "가입금액": amounts[0] * 10000
+                    })
+                
+                i = j
+                continue
+            i += 1
+    
+    # 중복 제거
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r["특약명"] not in seen:
+            seen.add(r["특약명"])
+            unique_results.append(r)
+    
+    return unique_results
+
+
+# ══════════════════════════════════════════════
 # 통합 파싱 (PDF 1회 오픈) + 메인 분기 + 범용 파서
 # ══════════════════════════════════════════════
 
@@ -1239,7 +1340,10 @@ def parse_pdf_all_in_one(pdf_path):
 
         # 보험사별로 pdfplumber에서 필요한 페이지 결정
         needs_pdfplumber_text = set()
-        if insurer_code == "samsung_life":
+        if insurer_code == "shinhan":
+            # 신한라이프: PyMuPDF 텍스트만으로 충분 (pdfplumber 불필요)
+            pass
+        elif insurer_code == "samsung_life":
             for pg in range(4, min(8, len(page_texts_fast))):
                 needs_pdfplumber_text.add(pg)
         elif insurer_code == "kb":
@@ -1317,7 +1421,10 @@ def parse_pdf_all_in_one(pdf_path):
         premium = _extract_premium_from_texts(page_texts[:10])
 
     # ── 특약 추출 (보험사별 분기) ──
-    if insurer_code == "samsung_life":
+    if insurer_code == "shinhan":
+        # 신한라이프: PyMuPDF 텍스트 기반 전용 파서 (대표지급금액 사용)
+        coverages = extract_coverage_shinhan(page_texts_fast)
+    elif insurer_code == "samsung_life":
         coverages = _extract_coverage_samsung_from_texts(page_texts, pdf_path)
     elif insurer_code == "mirae":
         coverages = extract_coverage_mirae(pdf_path)
@@ -1449,6 +1556,18 @@ def _detect_product_name_from_text(page_texts):
                 name = re.sub(r'\(무배당\).*', '', name).strip()
                 return name[:30] if len(name) > 30 else name
 
+            # 신한라이프: "신한통합건강보험 원(ONE)(무배당, 갱신형)" 패턴
+            shinhan_match = re.search(r'(신한통합[^\(\n]*보험[^\(\n]*?)(?:\s*원\(ONE\)|\(무배당)', line)
+            if shinhan_match:
+                name = shinhan_match.group(1).strip()
+                return name[:30] if len(name) > 30 else name
+            # 신한라이프 상품명 라벨: "상품명\n신한통합건강보험..."
+            if '신한통합' in line and '보험' in line:
+                name = re.sub(r'\(무배당.*\)|\(갱신형\)|\(생명보험\)', '', line).strip()
+                name = re.sub(r'\s*원\(ONE\)', '', name).strip()
+                if len(name) > 4 and '보험' in name:
+                    return name[:30] if len(name) > 30 else name
+
             # 현대해상: "무배당현대해상퍼펙트플러스종합보험(연만기갱신형)(Hi2601)" 패턴
             hyundai_match = re.search(r'(?:무배당)?현대해상(.+?종합보험|.+?보험)(?:\([^)]*\))', line)
             if hyundai_match:
@@ -1492,6 +1611,7 @@ def _extract_premium_from_texts(page_texts):
         r'보장보험료\s*합계\s*([\d,]+)\s*원',
         r'합\s*계\s*보\s*험\s*료\s*([\d,]+)\s*원',
         r'합계보험료\s*([\d,]+)\s*원',
+        r'보험료\s*합계\s*([\d,]+)원',  # 신한라이프: "보험료 합계\n90,906원"
         r'합\s*계\s*([\d,]+)',
         r'보험료\s*[:\s]?\s*([\d,]+)\s*원',
     ]
