@@ -304,28 +304,40 @@ def get_aggregated_amounts(pdf_coverages):
 
     # 뇌혈관질환 진단비
     # 삼성화재: 뇌혈관질환 진단비 + 뇌혈관질환(90일면책) 진단비 합산
-    # 현대해상: 뇌혈관질환(1)진단 + 뇌혈관질환(2)진단 → 합산X, 개별 최대값 사용
-    #   (1)과 (2)는 보장범위가 다른 별개 담보이므로 합산하지 않음
+    # 현대해상: 뇌혈관질환(Ⅰ)진단 = 넓은 범위(뇌혈관질환 전체), (Ⅱ)진단 = 좁은 범위(뇌졸중)
+    #   → 뇌혈관질환 진단비는 (Ⅰ)만 사용 (넓은 범위)
+    #   → (Ⅱ)는 뇌졸중진단비로 별도 매칭
     brain_diag_items = []
     for key, amount in simplified.items():
         if "뇌혈관질환" in key and "진단" in key and "수술" not in key:
             brain_diag_items.append((key, amount))
     if brain_diag_items:
-        # 현대해상 등: (1)/(2) 번호가 붙은 별개 담보가 있으면 합산하지 않고 최소값 사용
+        # 현대해상 등: (1)/(2) 번호가 붙은 별개 담보 존재 시
+        #   (1) = 넓은 범위 = 뇌혈관질환 진단비
+        #   (2) = 좁은 범위(뇌졸중) = 별도 뇌졸중진단비로 매칭
         has_numbered = any(re.search(r'\(\d\)', k) for k, _ in brain_diag_items)
         if has_numbered:
-            result["뇌혈관질환진단비"] = min(a for _, a in brain_diag_items)
+            # (1)번 담보만 사용 (넓은 범위 = 뇌혈관질환 전체)
+            for k, a in brain_diag_items:
+                if '(1)' in k:
+                    result["뇌혈관질환진단비"] = a
+                    break
+            # (1)이 없으면 최소값 fallback
+            if "뇌혈관질환진단비" not in result:
+                result["뇌혈관질환진단비"] = min(a for _, a in brain_diag_items)
         else:
             # 삼성화재 등: 90일면책 등 동일 보장 합산
             result["뇌혈관질환진단비"] = sum(a for _, a in brain_diag_items)
 
-    # 허혈성심장질환 진단비 (삼성화재: 허혈성심장질환 + 90일면책 합산)
-    # 현대해상: "심혈관질환(특정2)진단" = 허혈성심장질환 진단비
+    # 허혈성심장질환 진단비
+    # 삼성화재: 허혈성심장질환 + 90일면책 합산
+    # 현대해상: 심혈관질환(특정Ⅱ)진단 = 허혈성심장질환 범위 (약관 근거)
+    #   특정Ⅱ ≠ 특정2대 (특정2대 = 급성심근경색)
     heart_diag = 0
     for key, amount in simplified.items():
         if ("허혈성심장질환" in key or "허혈심장질환" in key) and "진단" in key and "수술" not in key:
             heart_diag += amount
-    # 현대해상: 심혈관질환(특정2)진단 → 허혈성심장질환진단비 (특정2대 제외)
+    # 현대해상 fallback: 심혈관질환(특정2)진단 → 허혈성심장질환 (특정2대 제외)
     if heart_diag == 0:
         for key, amount in simplified.items():
             if "심혈관질환(특정2)" in key and "2대" not in key and "진단" in key and "수술" not in key:
@@ -571,14 +583,14 @@ MATCHING_RULES = {
     "뇌혈관질환": {"type": "aggregate", "key": "뇌혈관질환진단비"},
     "뇌혈수술비": {"type": "aggregate", "key": "뇌혈수술비"},
     "뇌혈관질환수술비": {"type": "aggregate", "key": "뇌혈관질환수술비"},
-    "뇌졸증진단비": {"type": "direct_exclude", "keywords": [
+    "뇌졸증진단비": {"type": "direct", "keywords": [
         "뇌졸중진단비", "뇌졸증진단비",
-        "혈전용해치료비",  # 현대해상: 혈전용해치료비(뇌졸중) = 뇌졸중 진단비 성격
-    ], "exclude": ["심장질환", "순환계"]},
-    "뇌졸증": {"type": "direct_exclude", "keywords": [
+        "뇌혈관질환(2)진단",  # 현대해상: 뇌혈관질환(Ⅱ)진단 = 뇌졸중 범위 (거미막하출혈, 뇌내출혈, 뇌경색증)
+    ]},
+    "뇌졸증": {"type": "direct", "keywords": [
         "뇌졸중진단비", "뇌졸증진단비",
-        "혈전용해치료비",  # 현대해상
-    ], "exclude": ["심장질환", "순환계"]},
+        "뇌혈관질환(2)진단",  # 현대해상: 뇌혈관질환(Ⅱ)진단 = 뇌졸중 범위
+    ]},
     "뇌출혈진단비": {"type": "direct_exclude", "keywords": ["뇌출혈진단비"], "exclude": ["외상성"]},
     "뇌출혈": {"type": "direct_exclude", "keywords": ["뇌출혈진단비"], "exclude": ["외상성"]},
 
