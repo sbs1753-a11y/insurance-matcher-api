@@ -82,6 +82,13 @@ def simplify_pdf_name(name):
     name = re.sub(r'\(갑상선암및전립선암\s*제외\)', '', name)
     name = re.sub(r'\(갑상선암및전립선암\s*포함\)', '', name)
 
+    # 라이나생명 정리
+    name = re.sub(r'\(해약환급금미지급형2\)', '', name)
+    name = re.sub(r'\(해약환급금미\s*지급형2\)', '', name)
+    name = re.sub(r'\(해약환급금[^Ⅰ-ⅤI)]*형2?\)', '', name)
+    name = re.sub(r'새로담는', '', name)
+    name = re.sub(r'보장특약', '', name)  # 라이나 항암방사선약물치료"보장"특약 → "보장" 제거
+
     # 공통 정리
     name = re.sub(r'\s+', '', name)
     name = re.sub(r'\(\s*,?\s*\)', '', name)  # (,) 빈 괄호 제거
@@ -142,6 +149,8 @@ def get_surgery_grade_amounts(pdf_coverages):
                     f",{grade}종)",
                     # 흥국생명: 보장내용 상세 페이지에서 추출된 재해 종별 수술
                     f"[재해]{grade}종수술",
+                    # 라이나생명: 보장내역에서 추출된 종별 수술
+                    f"[수술]{grade}종수술",
                     # 미래에셋: 1-5종수술(X종) 또는 1-5종수술특약(X종)
                     f"({grade}종)",
                 ]
@@ -244,9 +253,15 @@ def get_aggregated_amounts(pdf_coverages):
 
     # 뇌혈관질환 수술비
     # 삼성화재: 2대주요기관질병 관혈수술비 + 비관혈수술비 = 1500 (뇌+심장 공통)
+    # 라이나생명: 심뇌혈관질환수술특약 → 뇌혈관 + 허혈성심장 둘 다 해당
     brain_surgery = 0
+    heart_surg_from_combined = 0
     for key, amount in simplified.items():
-        if "뇌혈관질환수술비" in key and "130대" not in key:
+        # 라이나생명: 심뇌혈관질환수술 (뇌 + 심장 통합) — 반드시 뇌혈관질환수술보다 먼저 체크
+        if "심뇌혈관질환수술" in key:
+            brain_surgery += amount
+            heart_surg_from_combined = amount  # 허혈성심장수술에도 사용
+        elif "뇌혈관질환수술비" in key and "130대" not in key:
             brain_surgery += amount
         elif "130대질병수술비" in key and "뇌혈관질환" in key:
             brain_surgery += amount
@@ -280,6 +295,9 @@ def get_aggregated_amounts(pdf_coverages):
         # 미래에셋: 허혈성심장질환수술(최초1회한) → 허혈성심장질환수술비
         elif "허혈성심장질환수술" in key and "130대" not in key:
             heart_surgery += amount
+    # 라이나생명: 심뇌혈관질환수술에서 허혈성심장수술 금액도 매핑
+    if heart_surgery == 0 and heart_surg_from_combined > 0:
+        heart_surgery = heart_surg_from_combined
     # 삼성화재: "2대주요기관질병 관혈수술비" + "비관혈수술비" (뇌+심장 공통)
     if major_organ_surgery > 0 and heart_surgery == 0:
         heart_surgery = major_organ_surgery
@@ -370,13 +388,15 @@ def get_aggregated_amounts(pdf_coverages):
     # ─────────────────────────────────────────────────────────
     exclude_kws = ["소액암", "호르몬", "세기조절", "양성자", "중입자", "표적", "카티", "주요치료", "종합병원"]
     
-    # 1) 단일 통합 특약 확인 ("항암방사선약물치료비" 이름 그대로)
+    # 1) 단일 통합 특약 확인 ("항암방사선약물치료비" 또는 "항암방사선약물치료" 이름 그대로)
     single_combined = 0
     for key, amount in simplified.items():
-        if ("항암방사선약물치료비" in key or "항암약물방사선치료비" in key):
-            if not any(ex in key for ex in exclude_kws) and "통합" not in key:
-                single_combined = amount
-                break
+        if ("항암방사선약물치료" in key or "항암약물방사선치료" in key):
+            # 분리형(항암방사선치료, 항암약물치료)은 제외 — 반드시 "방사선약물" 또는 "약물방사선" 포함
+            if "방사선약물" in key or "약물방사선" in key:
+                if not any(ex in key for ex in exclude_kws) and "통합" not in key:
+                    single_combined = amount
+                    break
     
     if single_combined > 0:
         # 단일 특약이 있으면 그 금액 그대로
@@ -414,6 +434,30 @@ def get_aggregated_amounts(pdf_coverages):
         antineoplastic_total = separated_value + integrated_amount
         if antineoplastic_total > 0:
             result["항암방사선약물치료비"] = antineoplastic_total
+
+    # 암진단(일반암) 합산
+    # 라이나생명: 암진단특약 3000만 + 통합암진단특약 7000만 = 10000만원
+    # 다른 보험사: 암진단(일반암) 단일 특약 = 그 금액 그대로
+    # 삼성화재: 암진단비(유사암제외) = 일반암
+    cancer_diag = 0
+    cancer_exclude_names = ["소액암진단", "전이암진단", "갑상선암", "기타피부암",
+                            "제자리암", "경계성종양", "남녀특정암", "특정암진단"]
+    for key, amount in simplified.items():
+        # "암진단" 또는 "암(...제외)진단" 패턴 매칭
+        if "암진단" in key or ("암" in key and "진단" in key and "수술" not in key):
+            # "유사암" 포함이더라도 "유사암제외" 패턴이면 일반암으로 봄
+            is_excluded = False
+            for ex_name in cancer_exclude_names:
+                if ex_name in key:
+                    is_excluded = True
+                    break
+            # "유사암" 단독 포함 (제외 패턴이 아닌 경우) = 유사암 특약 → 제외
+            if not is_excluded and "유사암" in key and "제외" not in key:
+                is_excluded = True
+            if not is_excluded:
+                cancer_diag += amount
+    if cancer_diag > 0:
+        result["암진단(일반암)"] = cancer_diag
 
     # 일반상해사망 / 재해사망
     death_amount = 0
@@ -458,6 +502,12 @@ def get_aggregated_amounts(pdf_coverages):
         if any(kw in key for kw in ["일반사망보장", "종신사망", "사망보장"]):
             result["일반사망"] = amount
             break
+    # 라이나생명: 주계약(건강보험) = 사망보험금
+    if "일반사망" not in result:
+        for key, amount in simplified.items():
+            if key == "건강보험":
+                result["일반사망"] = amount
+                break
 
     # 상해사망/재해사망 합산 (주계약 재해사망 + 재해사망 특약)
     total_death = 0
@@ -574,18 +624,16 @@ MATCHING_RULES = {
     "7종수술": {"type": "surgery_grade", "grade": 7},
 
     # 암
-    "암진단(일반암)": {"type": "direct", "keywords": [
-        "암진단비", "일반암진단비", "암(유사암제외)진단비",
-        "암(유사암제외)진단", "암(유사암제외)",
-        "암진단"  # 흥국생명: (무)암진단(갱신형)Ⅴ
-    ]},
+    "암진단(일반암)": {"type": "aggregate", "key": "암진단(일반암)"},
     "소액/유사암": {"type": "direct_exclude", "keywords": [
         "유사암진단비", "소액암진단비", "유사암진단",
         "소액암진단",  # 신한라이프: 소액암진단특약 → simplified "소액암진단"
         "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
     ], "exclude": ["제외"]},  # "암(유사암제외)진단" 제외
-    "전이암진단비": {"type": "direct", "keywords": ["전이암진단비", "전이암진단"]},
-    "전이암진단비": {"type": "direct", "keywords": ["전이암진단비", "전이암진단"]},
+    "전이암진단비": {"type": "direct", "keywords": [
+        "전이암진단비", "전이암진단",
+        "통합전이암진단",  # 라이나생명: 통합전이암진단특약
+    ]},
     "암주요치료비": {"type": "direct_exclude", "keywords": [
         "암주요치료비",
         "일반암주요치료",  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
@@ -634,8 +682,8 @@ MATCHING_RULES = {
         "뇌졸중진단비", "뇌졸증진단비",
         "뇌혈관질환(2)진단",  # 현대해상: 뇌혈관질환(Ⅱ)진단 = 뇌졸중 범위
     ]},
-    "뇌출혈진단비": {"type": "direct_exclude", "keywords": ["뇌출혈진단비"], "exclude": ["외상성"]},
-    "뇌출혈": {"type": "direct_exclude", "keywords": ["뇌출혈진단비"], "exclude": ["외상성"]},
+    "뇌출혈진단비": {"type": "direct_exclude", "keywords": ["뇌출혈진단비", "뇌출혈진단"], "exclude": ["외상성"]},
+    "뇌출혈": {"type": "direct_exclude", "keywords": ["뇌출혈진단비", "뇌출혈진단"], "exclude": ["외상성"]},
 
     # 심장
     "심혈관질환진단비": {"type": "direct", "keywords": [
@@ -655,10 +703,14 @@ MATCHING_RULES = {
     "허혈성심장질환수술비": {"type": "aggregate", "key": "허혈성심장질환수술비"},
     "급성심근경색진단비": {"type": "direct", "keywords": [
         "급성심근경색진단비", "급성심근경색증진단비",
+        "급성심근경색증진단",  # 라이나생명: 급성심근경색증진단특약
+        "급성심근경색진단",  # 일반적인 패턴
         "심혈관질환(특정2대)",  # 현대해상: 심혈관질환(특정2대)진단 = 급성심근경색
     ]},
     "급성심근경색": {"type": "direct", "keywords": [
         "급성심근경색진단비", "급성심근경색증진단비",
+        "급성심근경색증진단",  # 라이나생명
+        "급성심근경색진단",
         "심혈관질환(특정2대)",  # 현대해상
     ]},
 

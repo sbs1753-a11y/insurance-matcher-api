@@ -76,6 +76,8 @@ def detect_insurer(pdf_path):
         ("동양생명", "dongyang"),
         ("교보생명", "kyobo"),
         ("신한라이프", "shinhan"),
+        ("라이나생명", "lina"),
+        ("라이나", "lina"),
     ]
 
     for keyword, insurer in keywords_ordered:
@@ -84,6 +86,9 @@ def detect_insurer(pdf_path):
 
     if "kbinsure" in text.lower():
         return "kb"
+
+    if "lina.co.kr" in text.lower():
+        return "lina"
 
     if "삼성" in text:
         if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
@@ -1294,8 +1299,188 @@ def extract_coverage_shinhan(page_texts_fast):
 
 
 # ══════════════════════════════════════════════
-# 통합 파싱 (PDF 1회 오픈) + 메인 분기 + 범용 파서
+# 라이나생명 전용 파서 (PyMuPDF 텍스트 기반)
 # ══════════════════════════════════════════════
+
+def extract_coverage_lina(page_texts_fast):
+    """라이나생명 PDF 파싱 — PyMuPDF 텍스트 기반
+    
+    라이나생명 PDF 구조 (계약사항 페이지):
+      구분: 특약/주계약
+      특약명 (줄바꿈 가능)
+      피보험자: 라***객
+      가입금액: 숫자 (만원)
+      보험기간: 67년
+      납입기간: 20년
+      납입주기: 월납
+      보험료: 숫자 (원)
+    
+    보장내역 상세 페이지에서 1-5종 수술 종별 금액도 추출.
+    """
+    results = []
+    found_premium_total = False
+    
+    for text in page_texts_fast:
+        if not text:
+            continue
+        if found_premium_total:
+            break
+        
+        # 계약사항 테이블이 있는 페이지만 (가입금액 헤더 or 주계약/특약 키워드)
+        if '가입금액' not in text and '주계약' not in text:
+            continue
+        
+        if '납입보험료' in text:
+            found_premium_total = True
+        
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # "특약" 또는 "주계약" 구분 키워드 (단독 줄)
+            if line in ['특약', '주계약']:
+                category = line
+                name_parts = []
+                i += 1
+                
+                # 특약명 수집 (피보험자명 또는 숫자만 있는 줄이 나올 때까지)
+                while i < len(lines):
+                    l = lines[i].strip()
+                    # 피보험자명 → 특약명 종료
+                    if re.search(r'[가-힣]\*{2,}[가-힣]', l):
+                        break
+                    # 헤더/빈줄 스킵
+                    skip_headers = [
+                        '', '구분', '상품명', '피보험자', '가입금액',
+                        '(만원)', '보험', '기간', '납입', '주기',
+                        '보험료', '(원)', '계약사항', '납입보험료',
+                    ]
+                    if l in skip_headers:
+                        i += 1
+                        continue
+                    # 순수 숫자(가입금액 등)면 종료
+                    if re.match(r'^[\d,]+$', l):
+                        break
+                    name_parts.append(l)
+                    i += 1
+                
+                if not name_parts:
+                    continue
+                
+                full_name = ''.join(name_parts)
+                
+                # 피보험자 줄 건너뛰기 (라***객 등)
+                if i < len(lines) and re.search(r'[가-힣]\*{2,}[가-힣]', lines[i].strip()):
+                    i += 1
+                
+                # 가입금액 읽기 (만원 단위)
+                amount = None
+                if i < len(lines):
+                    amt_line = lines[i].strip()
+                    amt_match = re.match(r'^([\d,]+)$', amt_line)
+                    if amt_match:
+                        amount = int(amt_match.group(1).replace(',', ''))
+                        i += 1
+                
+                if full_name and amount:
+                    results.append({
+                        '특약명': full_name,
+                        '가입금액': amount * 10000  # 만원 → 원
+                    })
+                continue
+            
+            i += 1
+    
+    # 보장내역 상세 페이지에서 1-5종 수술 종별 금액 추출
+    surgery_results = _extract_lina_surgery_grade_detail(page_texts_fast)
+    for r in surgery_results:
+        if not any(existing['특약명'] == r['특약명'] for existing in results):
+            results.append(r)
+    
+    # 중복 제거
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r['특약명'] not in seen:
+            seen.add(r['특약명'])
+            unique_results.append(r)
+    
+    return unique_results
+
+
+def _extract_lina_surgery_grade_detail(page_texts_fast):
+    """라이나생명 보장내역에서 1-5종 수술 종별 금액 추출
+    
+    패턴: "무배당새로담는수술특약..." 아래에
+      1종 → 200,000원
+      2종 → 300,000원
+      3종 → 500,000원
+      4종 → 1,000,000원
+      5종 → 3,000,000원
+    
+    여러 수술특약(수술특약, 수술특약(연1회한))이 있을 수 있으므로
+    모든 종별 금액을 수집하여 같은 종의 금액을 합산.
+    """
+    grade_totals = {}  # {grade: total_amount}
+    
+    for text in page_texts_fast:
+        if not text:
+            continue
+        if '수술급여금' not in text or '1종' not in text:
+            continue
+        
+        lines = text.split('\n')
+        in_surgery_section = False
+        surgery_name = ""
+        
+        for idx, line in enumerate(lines):
+            l = line.strip()
+            
+            # 수술특약 보장내용 시작 감지
+            if '무배당새로담는수술특약' in l or '무배당새로담는수술특약(연1회한)' in l:
+                in_surgery_section = True
+                surgery_name = l
+                continue
+            
+            if not in_surgery_section:
+                continue
+            
+            # 종별 금액 패턴: "1종" → 다음 줄에 "200,000원"
+            grade_match = re.match(r'^(\d)종$', l)
+            if grade_match:
+                grade = int(grade_match.group(1))
+                if 1 <= grade <= 5:
+                    # 다음 몇 줄에서 금액 찾기
+                    for offset in range(1, 4):
+                        if idx + offset < len(lines):
+                            next_l = lines[idx + offset].strip()
+                            amt_match = re.search(r'([\d,]+)원', next_l)
+                            if amt_match:
+                                amount = int(amt_match.group(1).replace(',', ''))
+                                grade_totals[grade] = grade_totals.get(grade, 0) + amount
+                                break
+                continue
+            
+            # 다른 보장급부명이 나오면 섹션 종료
+            if '보장급부명' in l:
+                in_surgery_section = False
+                continue
+            
+            # 주계약 납입면제 등 다른 특약 시작
+            if l.startswith('1.') or l.startswith('※'):
+                in_surgery_section = False
+    
+    results = []
+    for grade in sorted(grade_totals.keys()):
+        results.append({
+            '특약명': f'[수술]{grade}종수술',
+            '가입금액': grade_totals[grade]
+        })
+    
+    return results
+
+
 
 def parse_pdf_all_in_one(pdf_path):
     """PDF를 최적화하여 파싱 (하이브리드: PyMuPDF 텍스트감지 + pdfplumber 테이블)
@@ -1342,6 +1527,9 @@ def parse_pdf_all_in_one(pdf_path):
         needs_pdfplumber_text = set()
         if insurer_code == "shinhan":
             # 신한라이프: PyMuPDF 텍스트만으로 충분 (pdfplumber 불필요)
+            pass
+        elif insurer_code == "lina":
+            # 라이나생명: PyMuPDF 텍스트만으로 충분 (pdfplumber 불필요)
             pass
         elif insurer_code == "samsung_life":
             for pg in range(4, min(8, len(page_texts_fast))):
@@ -1424,6 +1612,9 @@ def parse_pdf_all_in_one(pdf_path):
     if insurer_code == "shinhan":
         # 신한라이프: PyMuPDF 텍스트 기반 전용 파서 (대표지급금액 사용)
         coverages = extract_coverage_shinhan(page_texts_fast)
+    elif insurer_code == "lina":
+        # 라이나생명: PyMuPDF 텍스트 기반 전용 파서
+        coverages = extract_coverage_lina(page_texts_fast)
     elif insurer_code == "samsung_life":
         coverages = _extract_coverage_samsung_from_texts(page_texts, pdf_path)
     elif insurer_code == "mirae":
@@ -1455,6 +1646,7 @@ def parse_pdf_all_in_one(pdf_path):
         "lotte": "롯데손해보험", "nh": "NH농협생명",
         "dongyang": "동양생명", "kyobo": "교보생명",
         "shinhan": "신한라이프",
+        "lina": "라이나생명",
     }
 
     return {
@@ -1483,12 +1675,15 @@ def _detect_insurer_from_text(text):
         ("현대해상", "hyundai"), ("롯데손해", "lotte"),
         ("NH농협", "nh"), ("동양생명", "dongyang"),
         ("교보생명", "kyobo"), ("신한라이프", "shinhan"),
+        ("라이나생명", "lina"), ("라이나", "lina"),
     ]
     for keyword, insurer in keywords_ordered:
         if keyword in text:
             return insurer
     if "kbinsure" in text.lower():
         return "kb"
+    if "lina.co.kr" in text.lower():
+        return "lina"
     if "삼성" in text:
         if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
             return "samsung_life"
@@ -1566,6 +1761,15 @@ def _detect_product_name_from_text(page_texts):
                 name = re.sub(r'\(무배당.*\)|\(갱신형\)|\(생명보험\)', '', line).strip()
                 name = re.sub(r'\s*원\(ONE\)', '', name).strip()
                 if len(name) > 4 and '보험' in name:
+                    return name[:30] if len(name) > 30 else name
+
+            # 라이나생명: "무배당새로담는건강보험(해약환급금미지급형Ⅱ)" 패턴
+            lina_match = re.search(r'무배당(새로담는[^\(\n]*보험)', line)
+            if lina_match:
+                name = lina_match.group(1).strip()
+                # (해약환급금...) 부분 제거
+                name = re.sub(r'\(해약환급금.*', '', name).strip()
+                if len(name) > 4:
                     return name[:30] if len(name) > 30 else name
 
             # 현대해상: "무배당현대해상퍼펙트플러스종합보험(연만기갱신형)(Hi2601)" 패턴
