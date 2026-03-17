@@ -113,14 +113,14 @@ def get_surgery_grade_amounts(pdf_coverages):
     규칙:
     1) 질병/상해(재해) 양쪽에 같은 종별 수술이 있으면 min(질병, 상해) 사용
        (흥국생명: 질병수술1종 + 재해수술1종 → min)
-    2) 서로 다른 라이더 그룹(1-5종수술 vs 1-7종수술)이 있으면 sum
-       (미래에셋: 1-5종수술(1종) 20만 + [1-7종]1종 10만 → 30만)
+    2) 서로 다른 라이더 그룹(수술비Ⅱ(1-5종) vs 수술비(1-7종))이 있으면 sum
+       (메리츠: 수술비Ⅱ[상해1종]=20 + 수술비[상해1종]=30 → 50)
+    3) 미래에셋: 1-5종수술(1종) 20만 + [1-7종]1종 10만 → 30만
     """
-    # {grade: {"base": [amounts], "extra": [amounts]}}
-    # base = 1-5종수술/질병수술/재해수술 등 (min 적용)
-    # extra = 1-7종수술 상세 (별도 합산)
-    grade_base = {i: [] for i in range(1, 8)}
-    grade_extra = {i: [] for i in range(1, 8)}
+    # {grade: {"group_name": {"상해": amt, "질병": amt}}}
+    # 각 그룹 내에서 min(상해, 질병), 그룹 간 합산
+    grade_groups = {i: {} for i in range(1, 8)}
+    grade_extra = {i: [] for i in range(1, 8)}  # 미래에셋 1-7종 상세
 
     for cov in pdf_coverages:
         name = cov["특약명"]
@@ -157,22 +157,45 @@ def get_surgery_grade_amounts(pdf_coverages):
                 matched = False
                 for pattern in patterns:
                     if pattern in name:
-                        grade_base[grade].append(amount)
+                        # (N종) 패턴은 수술 관련 특약에서만 매칭
+                        if pattern == f"({grade}종)" and "수술" not in name:
+                            continue
+                        # 그룹 결정: 수술비Ⅱ vs 수술비 vs 기타
+                        if "수술비Ⅱ" in name or "수술비2" in name_simplified:
+                            group = "수술비2"
+                        elif re.match(r'^수술비\[', name):
+                            group = "수술비1-7"
+                        else:
+                            group = "default"
+                        # 상해/질병 구분
+                        is_injury = "상해" in pattern or "재해" in pattern or "상해" in name
+                        cat = "상해" if is_injury else "질병"
+                        if group not in grade_groups[grade]:
+                            grade_groups[grade][group] = {}
+                        grade_groups[grade][group][cat] = amount
                         matched = True
                         break
                 if not matched:
                     # 미래에셋 simplified: '1-5종수술(X종)무배당' 패턴
-                    if f"({grade}종)" in name_simplified:
-                        grade_base[grade].append(amount)
+                    if f"({grade}종)" in name_simplified and "수술" in name_simplified:
+                        group = "default"
+                        grade_groups[grade].setdefault(group, {})["질병"] = amount
                         matched = True
                 if matched:
                     break
 
     result = {}
     for grade in range(1, 8):
-        base_val = min(grade_base[grade]) if grade_base[grade] else 0
+        total = 0
+        # 각 그룹 내에서 min(상해, 질병) 적용, 그룹 간 합산
+        for group, cats in grade_groups[grade].items():
+            if len(cats) >= 2:
+                total += min(cats.values())
+            elif len(cats) == 1:
+                total += list(cats.values())[0]
+        # 미래에셋 1-7종 extra 추가
         extra_val = max(grade_extra[grade]) if grade_extra[grade] else 0
-        total = base_val + extra_val
+        total += extra_val
         if total > 0:
             result[grade] = total
 
@@ -196,12 +219,14 @@ def get_aggregated_amounts(pdf_coverages):
     disease_surgery = 0
     # 제외 키워드: 삼성화재의 특수 수술 분류는 질병수술비에 포함하지 않음
     disease_surgery_exclude = [
-        "130대", "5대질환", "111대", "2대주요기관", "상급종합병원",
+        "130대", "131대", "5대질환", "111대", "2대주요기관", "상급종합병원",
         "1~5종", "1-5종", "충수염", "4대특정", "양성신생물",
         "통합양성", "관혈", "비관혈", "통원", "백내장",
         "다빈치", "스텐트", "풍선", "창상봉합",
         "120대", "26대", "58대", "24대", "치핵", "갑상선", "다발성",
         "1종", "2종", "3종", "4종", "5종",
+        "특정5대질병",  # 메리츠: 질병수술비(특정5대질병 제외) 별도 특약
+        "호흡기관련",  # 메리츠: 호흡기관련질병수술비 별도 특약
     ]
     for key, amount in simplified.items():
         if "질병수술비" in key:
@@ -254,20 +279,30 @@ def get_aggregated_amounts(pdf_coverages):
     # 뇌혈관질환 수술비
     # 삼성화재: 2대주요기관질병 관혈수술비 + 비관혈수술비 = 1500 (뇌+심장 공통)
     # 라이나생명: 심뇌혈관질환수술특약 → 뇌혈관 + 허혈성심장 둘 다 해당
+    # 메리츠: 뇌혈관질환수술비 + 131대질병수술비(뇌혈관질환) 합산 가능
     brain_surgery = 0
     heart_surg_from_combined = 0
+    brain_surg_exclude = []
     for key, amount in simplified.items():
         # 라이나생명: 심뇌혈관질환수술 (뇌 + 심장 통합) — 반드시 뇌혈관질환수술보다 먼저 체크
         if "심뇌혈관질환수술" in key:
             brain_surgery += amount
             heart_surg_from_combined = amount  # 허혈성심장수술에도 사용
-        elif "뇌혈관질환수술비" in key and "130대" not in key:
-            brain_surgery += amount
+        elif "뇌혈관질환수술비" in key and "130대" not in key and "131대" not in key:
+            if not any(ex in key for ex in brain_surg_exclude):
+                brain_surgery += amount
         elif "130대질병수술비" in key and "뇌혈관질환" in key:
             brain_surgery += amount
-        # 미래에셋: 뇌혈관질환수술(최초1회한) → 뇌혈관질환수술비
-        elif "뇌혈관질환수술" in key and "130대" not in key:
+        # 메리츠: 131대질병수술비(뇌혈관질환) → 뇌혈관질환수술비에 합산
+        elif "131대질병수술비" in key and "뇌혈관질환" in key:
             brain_surgery += amount
+        # 메리츠: 5대질환 수술비(심장,뇌혈관 포함) 비관혈 → 뇌혈관 합산
+        elif "5대질환" in key and "뇌혈관" in key and "수술비" in key and "비관혈" in key:
+            brain_surgery += amount
+        # 미래에셋: 뇌혈관질환수술(최초1회한) → 뇌혈관질환수술비
+        elif "뇌혈관질환수술" in key and "130대" not in key and "131대" not in key:
+            if not any(ex in key for ex in brain_surg_exclude):
+                brain_surgery += amount
     # 삼성화재: "2대주요기관질병 관혈수술비" + "비관혈수술비" (뇌+심장 공통)
     major_organ_surgery = 0
     for key, amount in simplified.items():
@@ -286,15 +321,25 @@ def get_aggregated_amounts(pdf_coverages):
         result["뇌혈관질환수술비"] = brain_surgery
 
     # 허혈성심장질환수술비
+    # 메리츠: 허혈성심장질환수술비 + 131대질병수술비(심장질환) 합산
     heart_surgery = 0
+    heart_surg_exclude = []
     for key, amount in simplified.items():
-        if "허혈성심장질환수술비" in key and "130대" not in key:
-            heart_surgery += amount
+        if "허혈성심장질환수술비" in key and "130대" not in key and "131대" not in key:
+            if not any(ex in key for ex in heart_surg_exclude):
+                heart_surgery += amount
         elif "130대질병수술비" in key and "심장질환" in key:
             heart_surgery += amount
-        # 미래에셋: 허혈성심장질환수술(최초1회한) → 허혈성심장질환수술비
-        elif "허혈성심장질환수술" in key and "130대" not in key:
+        # 메리츠: 131대질병수술비(심장질환) → 허혈성심장질환수술비에 합산
+        elif "131대질병수술비" in key and "심장질환" in key:
             heart_surgery += amount
+        # 메리츠: 5대질환 수술비(심장,뇌혈관 포함) 비관혈 → 심장 합산
+        elif "5대질환" in key and "심장" in key and "수술비" in key and "비관혈" in key:
+            heart_surgery += amount
+        # 미래에셋: 허혈성심장질환수술(최초1회한) → 허혈성심장질환수술비
+        elif "허혈성심장질환수술" in key and "130대" not in key and "131대" not in key:
+            if not any(ex in key for ex in heart_surg_exclude):
+                heart_surgery += amount
     # 라이나생명: 심뇌혈관질환수술에서 허혈성심장수술 금액도 매핑
     if heart_surgery == 0 and heart_surg_from_combined > 0:
         heart_surgery = heart_surg_from_combined
@@ -338,10 +383,13 @@ def get_aggregated_amounts(pdf_coverages):
     # 현대해상: 뇌혈관질환(Ⅰ)진단 = 넓은 범위(뇌혈관질환 전체), (Ⅱ)진단 = 좁은 범위(뇌졸중)
     #   → 뇌혈관질환 진단비는 (Ⅰ)만 사용 (넓은 범위)
     #   → (Ⅱ)는 뇌졸중진단비로 별도 매칭
+    # 메리츠: 뇌혈관질환진단비 + 뇌혈관질환진단비Ⅱ 합산 (산정특례 제외)
+    brain_diag_exclude = ["산정특례", "중증질환자"]
     brain_diag_items = []
     for key, amount in simplified.items():
         if "뇌혈관질환" in key and "진단" in key and "수술" not in key:
-            brain_diag_items.append((key, amount))
+            if not any(ex in key for ex in brain_diag_exclude):
+                brain_diag_items.append((key, amount))
     if brain_diag_items:
         # 현대해상 등: (1)/(2) 번호가 붙은 별개 담보 존재 시
         #   (1) = 넓은 범위 = 뇌혈관질환 진단비
@@ -364,10 +412,13 @@ def get_aggregated_amounts(pdf_coverages):
     # 삼성화재: 허혈성심장질환 + 90일면책 합산
     # 현대해상: 심혈관질환(특정Ⅱ)진단 = 허혈성심장질환 범위 (약관 근거)
     #   특정Ⅱ ≠ 특정2대 (특정2대 = 급성심근경색)
+    # 메리츠: 허혈성심장질환진단비 + 허혈성심장질환진단비Ⅱ 합산 (산정특례 제외)
+    heart_diag_exclude = ["산정특례", "중증질환자"]
     heart_diag = 0
     for key, amount in simplified.items():
         if ("허혈성심장질환" in key or "허혈심장질환" in key) and "진단" in key and "수술" not in key:
-            heart_diag += amount
+            if not any(ex in key for ex in heart_diag_exclude):
+                heart_diag += amount
     # 현대해상 fallback: 심혈관질환(특정2)진단 → 허혈성심장질환 (특정2대 제외)
     if heart_diag == 0:
         for key, amount in simplified.items():
@@ -386,7 +437,13 @@ def get_aggregated_amounts(pdf_coverages):
     #   통합형 "통합항암약물방사선치료" → 단일 금액 (종별 있어도 하나)
     #   분리형 + 통합형 공존 → min(분리 방사선, 분리 약물) + 통합형
     # ─────────────────────────────────────────────────────────
-    exclude_kws = ["소액암", "호르몬", "세기조절", "양성자", "중입자", "표적", "카티", "주요치료", "종합병원"]
+    exclude_kws = ["소액암", "호르몬", "세기조절", "양성자", "중입자", "표적", "카티", "주요치료", "종합병원", "기타피부암", "갑상선암", "계속받는"]
+    
+    # 0) 메리츠 26종 항암방사선및약물치료비 (종별 동일금액 → 단건 최대값)
+    meritz_26_amount = 0
+    for key, amount in simplified.items():
+        if "26종" in key and "항암방사선" in key and "약물치료" in key:
+            meritz_26_amount = max(meritz_26_amount, amount)
     
     # 1) 단일 통합 특약 확인 ("항암방사선약물치료비" 또는 "항암방사선약물치료" 이름 그대로)
     single_combined = 0
@@ -430,8 +487,13 @@ def get_aggregated_amounts(pdf_coverages):
                 if not any(ex in key for ex in exclude_kws):
                     integrated_amount = max(integrated_amount, amount)
         
-        # 4) 합산: 분리형 min값 + 통합형
+        # 4) 합산: 분리형 min값 + 통합형 + 메리츠 26종
         antineoplastic_total = separated_value + integrated_amount
+        # 메리츠 26종은 단일 항목이 없을 때만 사용
+        if antineoplastic_total == 0 and meritz_26_amount > 0:
+            antineoplastic_total = meritz_26_amount
+        elif meritz_26_amount > 0:
+            antineoplastic_total += meritz_26_amount
         if antineoplastic_total > 0:
             result["항암방사선약물치료비"] = antineoplastic_total
 
@@ -439,10 +501,20 @@ def get_aggregated_amounts(pdf_coverages):
     # 라이나생명: 암진단특약 3000만 + 통합암진단특약 7000만 = 10000만원
     # 다른 보험사: 암진단(일반암) 단일 특약 = 그 금액 그대로
     # 삼성화재: 암진단비(유사암제외) = 일반암
+    # 메리츠 또또암: 암종별(30종)통합암진단비 = 종별로 4000만원 각각 → 중복X, 단건 4000만원
+    #   + 암진단및치료비[암진단비(유사암제외)] 1000만원은 별도 합산 가능
     cancer_diag = 0
     cancer_exclude_names = ["소액암진단", "전이암진단", "갑상선암", "기타피부암",
                             "제자리암", "경계성종양", "남녀특정암", "특정암진단"]
+    # 메리츠: 암종별(30종)통합암진단비는 각 종별 동일금액이므로 최대값 1건만 사용
+    cancer_种별_max = 0
+    cancer_종별_found = False
     for key, amount in simplified.items():
+        # 메리츠: 암종별(30종)통합암진단비 → 별도 처리
+        if "암종별" in key and "통합암진단비" in key:
+            cancer_종별_found = True
+            cancer_种별_max = max(cancer_种별_max, amount)
+            continue
         # "암진단" 또는 "암(...제외)진단" 패턴 매칭
         if "암진단" in key or ("암" in key and "진단" in key and "수술" not in key):
             # "유사암" 포함이더라도 "유사암제외" 패턴이면 일반암으로 봄
@@ -454,8 +526,14 @@ def get_aggregated_amounts(pdf_coverages):
             # "유사암" 단독 포함 (제외 패턴이 아닌 경우) = 유사암 특약 → 제외
             if not is_excluded and "유사암" in key and "제외" not in key:
                 is_excluded = True
+            # 메리츠: 암진단및치료비는 패키지 상품이므로 순수 암진단비에서 제외
+            if not is_excluded and "암진단및치료비" in key:
+                is_excluded = True
             if not is_excluded:
                 cancer_diag += amount
+    # 메리츠 종별 암진단비 추가 (중복X, 단건으로)
+    if cancer_종별_found:
+        cancer_diag += cancer_种별_max
     if cancer_diag > 0:
         result["암진단(일반암)"] = cancer_diag
 
@@ -513,7 +591,7 @@ def get_aggregated_amounts(pdf_coverages):
     total_death = 0
     for cov in pdf_coverages:
         name = simplify_pdf_name(cov["특약명"])
-        if "재해사망" in name:
+        if "재해사망" in name or "일반상해사망" in name:
             total_death += cov["가입금액"]
     # 흥국생명: 주계약(통합보험)에 재해사망 100% 포함시 합산
     if has_main_contract:
@@ -552,11 +630,13 @@ def get_aggregated_amounts(pdf_coverages):
     # 상해후유장해3% (합산)
     # 신한라이프: 재해장해특약 7000만원 + 주계약(신한통합건강보험) 500만원 = 7500만원
     # 다른 보험사: 단일 특약이면 그 금액만 사용
+    # 메리츠: 일반상해후유장해(3-100%) = 상해후유장해3%에 해당
     injury_disability = 0
     for key, amount in simplified.items():
         if any(kw in key for kw in [
             "상해3%이상후유장해", "상해후유장해3%",
             "재해후유장해보장", "재해후유장해",
+            "일반상해후유장해(3-100%)",  # 메리츠
         ]):
             injury_disability = amount
             break
@@ -577,6 +657,70 @@ def get_aggregated_amounts(pdf_coverages):
                 break
     if injury_disability > 0:
         result["상해후유장해3%"] = injury_disability
+
+    # 전이암진단비
+    # 라이나생명: 통합전이암진단특약 → 직접 매칭
+    # 메리츠 또또암: 암종별(30종)통합암진단비(전이포함) 4000만원 = 전이암에도 동일 금액 적용
+    transfer_cancer = 0
+    for key, amount in simplified.items():
+        if "전이암진단" in key or "전이암진단비" in key:
+            transfer_cancer = max(transfer_cancer, amount)
+        elif "통합전이암" in key:
+            transfer_cancer = max(transfer_cancer, amount)
+    # 메리츠: 암종별 통합암진단비(전이포함)에서 최대값 사용 (전이포함이므로)
+    if transfer_cancer == 0 and cancer_종별_found:
+        transfer_cancer = cancer_种별_max
+    if transfer_cancer > 0:
+        result["전이암진단비"] = transfer_cancer
+
+    # 표적항암약물치료비
+    # 메리츠: 표적항암약물허가치료비(연간 약물종류 개수별)(비급여)[N종이상] 형태
+    #   → 3종이상 > 2종이상 > 1종이상 우선순위로 최상위 등급 선택
+    #   → 급여/비급여가 simplify 후 같은 키로 합쳐지므로 원본에서 직접 처리
+    # 다른 보험사: 표적항암약물치료비/허가치료 단일 특약 → max 사용
+    target_chemo = 0
+    
+    # 메리츠 종류별 체크: 원본 coverages에서 비급여 3종이상 우선 탐색
+    grade_amounts = {}  # {등급: 비급여금액}
+    grade_amounts_all = {}  # {등급: 모든금액 중 max}
+    has_grade_items = False
+    for cov in pdf_coverages:
+        name = cov["특약명"]
+        amount = cov["가입금액"]
+        if "표적항암약물" not in name or "허가치료" not in name:
+            continue
+        if "약물종류" in name or "개수별" in name:
+            has_grade_items = True
+            for grade_label in ["3종이상", "2종이상", "1종이상"]:
+                if grade_label in name:
+                    # 비급여 항목 우선
+                    if "비급여" in name or "전액본인부담" in name:
+                        grade_amounts[grade_label] = max(grade_amounts.get(grade_label, 0), amount)
+                    grade_amounts_all[grade_label] = max(grade_amounts_all.get(grade_label, 0), amount)
+                    break
+    
+    if has_grade_items:
+        # 3종이상 > 2종이상 > 1종이상 우선순위 (비급여 우선, 없으면 전체)
+        for grade_label in ["3종이상", "2종이상", "1종이상"]:
+            if grade_label in grade_amounts and grade_amounts[grade_label] > 0:
+                target_chemo = grade_amounts[grade_label]
+                break
+            elif grade_label in grade_amounts_all and grade_amounts_all[grade_label] > 0:
+                target_chemo = grade_amounts_all[grade_label]
+                break
+    
+    if target_chemo == 0:
+        # 종류별이 아닌 일반 표적항암 항목 (다른 보험사 또는 표적항암약물허가치료비Ⅱ 등)
+        for key, amount in simplified.items():
+            if "표적항암약물" in key and "허가치료" in key:
+                if "약물종류" not in key and "개수별" not in key:
+                    target_chemo = max(target_chemo, amount)
+            elif "표적항암약물치료비" in key:
+                if "약물종류" not in key and "개수별" not in key:
+                    target_chemo = max(target_chemo, amount)
+    
+    if target_chemo > 0:
+        result["표적항암약물치료비"] = target_chemo
 
     # 교통사고처리지원금 (중상해보장확대만 — 6주미만 제외)
     for cov in pdf_coverages:
@@ -630,20 +774,15 @@ MATCHING_RULES = {
         "소액암진단",  # 신한라이프: 소액암진단특약 → simplified "소액암진단"
         "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
     ], "exclude": ["제외"]},  # "암(유사암제외)진단" 제외
-    "전이암진단비": {"type": "direct", "keywords": [
-        "전이암진단비", "전이암진단",
-        "통합전이암진단",  # 라이나생명: 통합전이암진단특약
-    ]},
+    "전이암진단비": {"type": "aggregate", "key": "전이암진단비"},
     "암주요치료비": {"type": "direct_exclude", "keywords": [
         "암주요치료비",
         "일반암주요치료",  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
         "암전액본인부담",  # 삼성화재: 종합병원 암 전액본인부담(비급여포함) 통합치료비
-        "암통합치료비",  # 삼성화재: 통합치료비(실속형)
-    ], "exclude": ["소액암", "유사암", "전이암"]},
+        "암통합치료비",  # 삼성화재/메리츠: 통합치료비(실속형), 암통합치료비(기본형)
+    ], "exclude": ["소액암", "유사암", "전이암", "생활비", "진단및치료비", "통합치료비2", "통합치료비3"]},
     "항암방사선약물치료비": {"type": "aggregate", "key": "항암방사선약물치료비"},
-    "표적항암약물치료비": {"type": "direct", "keywords": [
-        "표적항암약물치료비", "표적항암약물허가치료"
-    ]},
+    "표적항암약물치료비": {"type": "aggregate", "key": "표적항암약물치료비"},
     "양성자방사선치료비": {"type": "direct", "keywords": [
         "양성자방사선치료비", "항암양성자방사선치료",
         "항암방사선(양성자)",  # 현대해상: 항암방사선(양성자)치료
@@ -715,10 +854,11 @@ MATCHING_RULES = {
     ]},
 
     # 입원/응급
-    "질병입원": {"type": "direct_exclude", "keywords": ["질병입원일당", "질병입원비"], "exclude": ["다빈도", "특정", "수술", "중환자실"]},
-    "상해입원": {"type": "direct_exclude", "keywords": ["상해입원일당", "상해입원비"], "exclude": ["수술", "중환자실"]},
+    "질병입원": {"type": "direct_exclude", "keywords": ["질병입원일당", "질병입원비"], "exclude": ["다빈도", "특정", "수술", "중환자실", "상급병실", "간병인", "요양성", "2-3인실", "1인실"]},
+    "상해입원": {"type": "direct_exclude", "keywords": ["상해입원일당", "상해입원비"], "exclude": ["수술", "중환자실", "상급병실", "간병인", "2-3인실", "1인실"]},
     "응급실내원(응급)": {"type": "direct", "keywords": [
-        "응급실내원(응급)", "응급실내원"  # 미래에셋: 응급실내원특약 (응급/비응급 구분 없음)
+        "응급실내원(응급)", "응급실내원",  # 미래에셋: 응급실내원특약 (응급/비응급 구분 없음)
+        "응급실내원비(응급)",  # 메리츠: 응급실내원비(응급)
     ]},
     "응급실내원(비응급)": {"type": "direct", "keywords": ["응급실내원(비응급)"]},
 
@@ -730,11 +870,12 @@ MATCHING_RULES = {
     # 후유장해
     # 신한라이프: 재해장해특약 7000만원 + 주계약(신한통합건강보험) 500만원 = 7500만원
     "상해후유장해3%": {"type": "aggregate", "key": "상해후유장해3%"},
-    "질병후유장해3%": {"type": "direct", "keywords": [
+    "질병후유장해3%": {"type": "direct_exclude", "keywords": [
         "질병3%이상후유장해", "질병후유장해3%",
-        "질병후유장해보장", "질병후유장해",  # 흥국생명: 질병후유장해보장
+        "질병후유장해보장", "질병후유장해(3-100%)",  # 메리츠: 질병후유장해(3-100%)
+        "질병후유장해",  # 흥국생명: 질병후유장해보장
         "질병장해"  # 미래에셋/신한라이프: 질병장해보장특약
-    ]},
+    ], "exclude": ["80%이상"]},
     "상해후유장해": {"type": "direct", "keywords": [
         "상해후유장해", "일반상해80%이상후유장해",
         "재해후유장해보장", "재해후유장해"

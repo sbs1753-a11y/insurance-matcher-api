@@ -90,6 +90,9 @@ def detect_insurer(pdf_path):
     if "lina.co.kr" in text.lower():
         return "lina"
 
+    if "meritzfire.com" in text.lower() or "1566-7711" in text:
+        return "meritz"
+
     if "삼성" in text:
         if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
             return "samsung_life"
@@ -1481,6 +1484,205 @@ def _extract_lina_surgery_grade_detail(page_texts_fast):
     return results
 
 
+def extract_coverage_meritz(page_texts_fast):
+    """메리츠화재 PDF 파싱 — PyMuPDF 텍스트 기반
+    
+    메리츠화재 PDF 구조 (가입담보리스트 페이지):
+      번호 (숫자)
+      갱신형 담보명
+      가입금액 (예: 1천만원, 20만원, 1억원)
+      보험료(원)
+      납기/만기
+    
+    세부보장 하위 항목은 ┗ 로 시작.
+    """
+    results = []
+    
+    amount_pattern = re.compile(
+        r'^(\d[\d,]*)([억만천백])([\d,]*)([만천]?)원?$'
+    )
+    
+    def parse_meritz_amount(text):
+        """메리츠 가입금액 파싱 (예: '1천만원' -> 1000, '20만원' -> 20, '1억원' -> 10000)
+        단위: 만원 반환
+        """
+        text = text.replace(' ', '').replace(',', '')
+        if text in ['안내참조', '세부보장참조', '세부보장', '참조']:
+            return None
+        
+        # "간병인지원" 등 금액이 아닌 텍스트
+        if not any(c.isdigit() for c in text):
+            return None
+        
+        # "1억원", "1억5천만원" 등
+        m = re.match(r'^(\d+)억(\d*)([천만]?)(\d*)([만]?)원?$', text)
+        if m:
+            total = int(m.group(1)) * 10000
+            if m.group(2):
+                sub_num = int(m.group(2))
+                sub_unit = m.group(3)
+                if sub_unit == '천':
+                    total += sub_num * 1000
+                    if m.group(4):
+                        total += int(m.group(4))
+                elif sub_unit == '만':
+                    total += sub_num
+                else:
+                    total += sub_num
+            return total
+        
+        # "1천만원", "5천만원"
+        m = re.match(r'^(\d+)천(\d*)만원?$', text)
+        if m:
+            total = int(m.group(1)) * 1000
+            if m.group(2):
+                total += int(m.group(2))
+            return total
+        
+        # "5백만원", "1백50만원"
+        m = re.match(r'^(\d+)백(\d*)만원?$', text)
+        if m:
+            total = int(m.group(1)) * 100
+            if m.group(2):
+                total += int(m.group(2))
+            return total
+
+        # "20만원", "3만원"
+        m = re.match(r'^(\d+)만원?$', text)
+        if m:
+            return int(m.group(1))
+        
+        # "1천원" (보험료납입지원금 등 — 무시)
+        m = re.match(r'^(\d+)천원?$', text)
+        if m:
+            return None  # 1000원 미만은 무시
+        
+        # "1백만원" without 만 → skip
+        m = re.match(r'^(\d+)백원?$', text)
+        if m:
+            return None
+        
+        return None
+    
+    for text in page_texts_fast:
+        if not text:
+            continue
+        
+        # 가입담보리스트 또는 담보사항이 있는 페이지만 처리
+        if '가입담보' not in text and '담보사항' not in text and '가입금액' not in text:
+            continue
+        
+        # 보험료 납입면제 안내 페이지는 스킵
+        if '보험료 납입면제 관련 안내' in text:
+            continue
+        # 상품설명서 상세 페이지 스킵
+        if '보험금 지급사유' in text and '가입담보리스트' not in text and '보장보험료 합계' not in text:
+            continue
+        # 메리츠 "가입담보 및 보장내용" 상세설명 페이지 스킵
+        # (번호 + 담보명 + 상세 설명 + 가입금액이 공존하여 오파싱 발생)
+        if '가입담보 및 보장내용' in text and '진단확정되었을 때' in text:
+            continue
+        # "가입담보 및 보장내용" 페이지 스킵 (보장내용 상세 페이지)
+        if '가입담보 및 보장내용' in text and '가입담보리스트' not in text:
+            continue
+        
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # 번호 패턴 감지 (순수 숫자, 1~999)
+            if re.match(r'^\d{1,3}$', line):
+                num = int(line)
+                if 1 <= num <= 999:
+                    # 다음 줄 = 담보명
+                    i += 1
+                    if i >= len(lines):
+                        break
+                    
+                    name = lines[i].strip()
+                    
+                    # 하위 항목(┗)은 이미 번호 뒤에 나옴
+                    # 담보명이 비어있거나 숫자면 스킵
+                    if not name or re.match(r'^\d{1,3}$', name):
+                        i += 1
+                        continue
+                    
+                    # 담보명이 여러 줄인 경우 (줄바꿈)
+                    # 다음 줄이 금액 패턴이 아니면 담보명 연장
+                    while i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        if next_line.endswith('원') or next_line in ['세부보장', '참조', '안내참조']:
+                            break
+                        if re.match(r'^\d{1,3}$', next_line):
+                            break
+                        if re.match(r'^\d[\d,]+$', next_line):
+                            break
+                        if next_line.startswith('갱신종료') or '년 /' in next_line:
+                            break
+                        if next_line in ['기본계약', '사망후유', '3대진단', '입원일당', '수술', 
+                                         '골절/화상', '기타', '치료비', '영업담당자']:
+                            break
+                        if not next_line:
+                            break
+                        # 다음 줄 '한)' 같은 잘린 부분
+                        name += next_line
+                        i += 1
+                    
+                    # 다음 줄 = 가입금액
+                    i += 1
+                    if i >= len(lines):
+                        break
+                    
+                    amount_text = lines[i].strip()
+                    
+                    # "세부보장\n참조" 패턴 처리
+                    if amount_text == '세부보장':
+                        i += 1
+                        if i < len(lines) and lines[i].strip() == '참조':
+                            i += 1
+                        continue
+                    
+                    if amount_text == '안내참조':
+                        i += 1
+                        continue
+                    
+                    # "간병인지원\n또는 2만원" 등 특수 패턴
+                    if '간병인지원' in amount_text:
+                        # 간병인 담보는 금액이 특수 — 스킵하거나 2만원으로 처리
+                        i += 1
+                        if i < len(lines) and '만원' in lines[i].strip():
+                            amount_text = lines[i].strip().replace('또는 ', '').replace('또는', '')
+                        else:
+                            continue
+                    
+                    amount = parse_meritz_amount(amount_text)
+                    if amount is not None and amount > 0:
+                        # "갱신형" 접두사 제거하여 정규화
+                        clean_name = name
+                        clean_name = re.sub(r'^\(?\d+년갱신\)?', '', clean_name).strip()
+                        clean_name = re.sub(r'^갱신형\s*', '', clean_name).strip()
+                        clean_name = re.sub(r'^┗\s*갱신형\s*', '┗ ', clean_name).strip()
+                        clean_name = re.sub(r'^┗\s*', '', clean_name).strip()
+                        
+                        # 만원 → 원 단위 변환 (다른 보험사 파서와 통일)
+                        results.append({"특약명": clean_name, "가입금액": amount * 10000})
+                    
+                    i += 1
+                    continue
+            
+            i += 1
+    
+    # 중복 제거 (같은 특약명이면 첫 번째만 유지)
+    seen = set()
+    unique_results = []
+    for r in results:
+        key = r["특약명"]
+        if key not in seen:
+            seen.add(key)
+            unique_results.append(r)
+    return unique_results
+
 
 def parse_pdf_all_in_one(pdf_path):
     """PDF를 최적화하여 파싱 (하이브리드: PyMuPDF 텍스트감지 + pdfplumber 테이블)
@@ -1530,6 +1732,9 @@ def parse_pdf_all_in_one(pdf_path):
             pass
         elif insurer_code == "lina":
             # 라이나생명: PyMuPDF 텍스트만으로 충분 (pdfplumber 불필요)
+            pass
+        elif insurer_code == "meritz":
+            # 메리츠화재: PyMuPDF 텍스트만으로 충분 (pdfplumber 불필요)
             pass
         elif insurer_code == "samsung_life":
             for pg in range(4, min(8, len(page_texts_fast))):
@@ -1615,6 +1820,9 @@ def parse_pdf_all_in_one(pdf_path):
     elif insurer_code == "lina":
         # 라이나생명: PyMuPDF 텍스트 기반 전용 파서
         coverages = extract_coverage_lina(page_texts_fast)
+    elif insurer_code == "meritz":
+        # 메리츠화재: PyMuPDF 텍스트 기반 전용 파서
+        coverages = extract_coverage_meritz(page_texts_fast)
     elif insurer_code == "samsung_life":
         coverages = _extract_coverage_samsung_from_texts(page_texts, pdf_path)
     elif insurer_code == "mirae":
@@ -1684,6 +1892,8 @@ def _detect_insurer_from_text(text):
         return "kb"
     if "lina.co.kr" in text.lower():
         return "lina"
+    if "meritzfire.com" in text.lower() or "1566-7711" in text:
+        return "meritz"
     if "삼성" in text:
         if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
             return "samsung_life"
