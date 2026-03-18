@@ -93,6 +93,10 @@ def detect_insurer(pdf_path):
     if "meritzfire.com" in text.lower() or "1566-7711" in text:
         return "meritz"
 
+    # DB손해보험: PDF에 "DB손해" 키워드 없이 "idbins.com" 또는 "프로미라이프" 포함
+    if "idbins.com" in text.lower() or "프로미라이프" in text:
+        return "db"
+
     if "삼성" in text:
         if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
             return "samsung_life"
@@ -1894,6 +1898,9 @@ def _detect_insurer_from_text(text):
         return "lina"
     if "meritzfire.com" in text.lower() or "1566-7711" in text:
         return "meritz"
+    # DB손해보험: PDF에 "DB손해" 키워드 없이 "idbins.com" 또는 "프로미라이프" 포함
+    if "idbins.com" in text.lower() or "프로미라이프" in text:
+        return "db"
     if "삼성" in text:
         if any(kw in text for kw in ["생명보험", "건강보험", "종신보험", "The간편한", "다모은"]):
             return "samsung_life"
@@ -1981,6 +1988,14 @@ def _detect_product_name_from_text(page_texts):
                 name = re.sub(r'\(해약환급금.*', '', name).strip()
                 if len(name) > 4:
                     return name[:30] if len(name) > 30 else name
+
+            # DB손해보험: "무배당 프로미라이프\n건강할때 가입하는 청춘어람플러스 종합보험2601" 패턴
+            db_match = re.search(r'(?:건강할때\s*가입하는\s*)?([^\n]*(?:종합보험|건강보험|보장보험|질병보험)[^\n]*\d{4})', line)
+            if db_match and 'idbins' not in line.lower() and '프로미라이프' not in line:
+                name = db_match.group(1).strip()
+                name = re.sub(r'\(무배당\).*', '', name).strip()
+                if len(name) > 4 and '보험' in name:
+                    return name[:50] if len(name) > 50 else name
 
             # 현대해상: "무배당현대해상퍼펙트플러스종합보험(연만기갱신형)(Hi2601)" 패턴
             hyundai_match = re.search(r'(?:무배당)?현대해상(.+?종합보험|.+?보험)(?:\([^)]*\))', line)

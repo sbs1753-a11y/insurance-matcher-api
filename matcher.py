@@ -89,6 +89,16 @@ def simplify_pdf_name(name):
     name = re.sub(r'새로담는', '', name)
     name = re.sub(r'보장특약', '', name)  # 라이나 항암방사선약물치료"보장"특약 → "보장" 제거
 
+    # DB손해보험 정리
+    name = re.sub(r'^\(건강고지\)\s*', '', name)
+    name = re.sub(r'^건강고지\)\s*', '', name)
+    name = re.sub(r'\(동일사고당\d+회지급\)', '', name)
+    name = re.sub(r'\(동일질병당\d+회지급\)', '', name)
+    name = re.sub(r'\(매회지급\)', '', name)
+    name = re.sub(r'\(\d+%체증형\)', '', name)
+    name = re.sub(r'^체증형', '', name)  # 체증형뇌혈관질환수술비 → 뇌혈관질환수술비
+    name = re.sub(r'\(최초\d+회한\)', '', name)
+
     # 공통 정리
     name = re.sub(r'\s+', '', name)
     name = re.sub(r'\(\s*,?\s*\)', '', name)  # (,) 빈 괄호 제거
@@ -227,6 +237,8 @@ def get_aggregated_amounts(pdf_coverages):
         "1종", "2종", "3종", "4종", "5종",
         "특정5대질병",  # 메리츠: 질병수술비(특정5대질병 제외) 별도 특약
         "호흡기관련",  # 메리츠: 호흡기관련질병수술비 별도 특약
+        "119대",  # DB손해: 119대질병수술비Ⅲ 별도 항목
+        "특정경증",  # DB손해: 질병수술비(특정경증질환,백내장및대장용종제외) 별도 항목
     ]
     for key, amount in simplified.items():
         if "질병수술비" in key:
@@ -280,9 +292,11 @@ def get_aggregated_amounts(pdf_coverages):
     # 삼성화재: 2대주요기관질병 관혈수술비 + 비관혈수술비 = 1500 (뇌+심장 공통)
     # 라이나생명: 심뇌혈관질환수술특약 → 뇌혈관 + 허혈성심장 둘 다 해당
     # 메리츠: 뇌혈관질환수술비 + 131대질병수술비(뇌혈관질환) 합산 가능
+    # DB손해: 체증형뇌혈관질환수술비 + 주요심,뇌,5대혈관및양성뇌종양수술비 합산
     brain_surgery = 0
     heart_surg_from_combined = 0
     brain_surg_exclude = []
+    combined_major_surgery = 0  # DB손해: 주요심,뇌,5대혈관및양성뇌종양수술비 (뇌+심장 공통)
     for key, amount in simplified.items():
         # 라이나생명: 심뇌혈관질환수술 (뇌 + 심장 통합) — 반드시 뇌혈관질환수술보다 먼저 체크
         if "심뇌혈관질환수술" in key:
@@ -303,6 +317,12 @@ def get_aggregated_amounts(pdf_coverages):
         elif "뇌혈관질환수술" in key and "130대" not in key and "131대" not in key:
             if not any(ex in key for ex in brain_surg_exclude):
                 brain_surgery += amount
+        # DB손해: 주요심,뇌,5대혈관및양성뇌종양수술비 → 뇌혈관+허혈심장 공통
+        elif "주요심" in key and "뇌" in key and "5대혈관" in key and "수술비" in key:
+            combined_major_surgery = amount
+    # DB손해: 주요심,뇌,5대혈관 수술비를 뇌혈관수술에 합산
+    if combined_major_surgery > 0:
+        brain_surgery += combined_major_surgery
     # 삼성화재: "2대주요기관질병 관혈수술비" + "비관혈수술비" (뇌+심장 공통)
     major_organ_surgery = 0
     for key, amount in simplified.items():
@@ -322,10 +342,15 @@ def get_aggregated_amounts(pdf_coverages):
 
     # 허혈성심장질환수술비
     # 메리츠: 허혈성심장질환수술비 + 131대질병수술비(심장질환) 합산
+    # DB손해: 체증형허혈심장질환수술비 → simplified '허혈심장질환수술비' + 주요심,뇌,5대혈관 공통
     heart_surgery = 0
     heart_surg_exclude = []
     for key, amount in simplified.items():
         if "허혈성심장질환수술비" in key and "130대" not in key and "131대" not in key:
+            if not any(ex in key for ex in heart_surg_exclude):
+                heart_surgery += amount
+        # DB손해: 허혈심장질환수술비 (simplified: 체증형 제거 후)
+        elif "허혈심장질환수술비" in key and "130대" not in key and "131대" not in key:
             if not any(ex in key for ex in heart_surg_exclude):
                 heart_surgery += amount
         elif "130대질병수술비" in key and "심장질환" in key:
@@ -340,6 +365,9 @@ def get_aggregated_amounts(pdf_coverages):
         elif "허혈성심장질환수술" in key and "130대" not in key and "131대" not in key:
             if not any(ex in key for ex in heart_surg_exclude):
                 heart_surgery += amount
+    # DB손해: 주요심,뇌,5대혈관 수술비를 허혈심장수술에도 합산
+    if combined_major_surgery > 0:
+        heart_surgery += combined_major_surgery
     # 라이나생명: 심뇌혈관질환수술에서 허혈성심장수술 금액도 매핑
     if heart_surgery == 0 and heart_surg_from_combined > 0:
         heart_surgery = heart_surg_from_combined
@@ -497,6 +525,31 @@ def get_aggregated_amounts(pdf_coverages):
         if antineoplastic_total > 0:
             result["항암방사선약물치료비"] = antineoplastic_total
 
+    # 암주요치료비
+    # 여러 보험사에서 동일 키가 여러 값(덮어쓰기)으로 나올 수 있으므로 원본에서 max 사용
+    # DB손해: 하이클래스암주요치료비Ⅱ(수술시) 1000만 / 500만 (동일 키, 다른 금액) → max
+    # 흥국생명: 종합병원일반암주요치료
+    # 삼성화재: 암전액본인부담, 암통합치료비
+    # 메리츠: 암통합치료비
+    cancer_treatment_exclude = ["소액암", "유사암", "전이암", "생활비", "진단및치료비", "통합치료비2", "통합치료비3"]
+    cancer_treatment = 0
+    for cov in pdf_coverages:
+        key = simplify_pdf_name(cov["특약명"])
+        amount = cov["가입금액"]
+        matched_kw = False
+        for kw in ["암주요치료비", "하이클래스암주요치료비", "일반암주요치료",
+                    "암전액본인부담", "암통합치료비"]:
+            if kw in key:
+                matched_kw = True
+                break
+        if not matched_kw:
+            continue
+        if any(ex in key for ex in cancer_treatment_exclude):
+            continue
+        cancer_treatment = max(cancer_treatment, amount)
+    if cancer_treatment > 0:
+        result["암주요치료비"] = cancer_treatment
+
     # 암진단(일반암) 합산
     # 라이나생명: 암진단특약 3000만 + 통합암진단특약 7000만 = 10000만원
     # 다른 보험사: 암진단(일반암) 단일 특약 = 그 금액 그대로
@@ -631,18 +684,20 @@ def get_aggregated_amounts(pdf_coverages):
     # 신한라이프: 재해장해특약 7000만원 + 주계약(신한통합건강보험) 500만원 = 7500만원
     # 다른 보험사: 단일 특약이면 그 금액만 사용
     # 메리츠: 일반상해후유장해(3-100%) = 상해후유장해3%에 해당
+    # DB손해: 상해후유장해(3-100%) — 동일 키가 두 번(1억, 1만) 있으므로 max 사용
     injury_disability = 0
-    for key, amount in simplified.items():
+    for cov in pdf_coverages:
+        key = simplify_pdf_name(cov["특약명"])
+        amount = cov["가입금액"]
         if any(kw in key for kw in [
             "상해3%이상후유장해", "상해후유장해3%",
             "재해후유장해보장", "재해후유장해",
             "일반상해후유장해(3-100%)",  # 메리츠
+            "상해후유장해(3-100%)",  # DB손해
         ]):
-            injury_disability = amount
-            break
+            injury_disability = max(injury_disability, amount)
         elif "기본계약(상해후유장해" in key:
-            injury_disability = amount
-            break
+            injury_disability = max(injury_disability, amount)
     # 신한라이프/미래에셋: 재해장해 (simplified 이름) - 부분 일치 (미래에셋: "재해장해최초계")
     if injury_disability == 0:
         for key, amount in simplified.items():
@@ -775,12 +830,7 @@ MATCHING_RULES = {
         "소액암New보장", "소액암보장"  # 흥국생명: (무)소액암New보장(갱신형)
     ], "exclude": ["제외"]},  # "암(유사암제외)진단" 제외
     "전이암진단비": {"type": "aggregate", "key": "전이암진단비"},
-    "암주요치료비": {"type": "direct_exclude", "keywords": [
-        "암주요치료비",
-        "일반암주요치료",  # 흥국생명: (무)종합병원일반암주요치료+(치료별,연간1회한)(수술) 등
-        "암전액본인부담",  # 삼성화재: 종합병원 암 전액본인부담(비급여포함) 통합치료비
-        "암통합치료비",  # 삼성화재/메리츠: 통합치료비(실속형), 암통합치료비(기본형)
-    ], "exclude": ["소액암", "유사암", "전이암", "생활비", "진단및치료비", "통합치료비2", "통합치료비3"]},
+    "암주요치료비": {"type": "aggregate", "key": "암주요치료비"},
     "항암방사선약물치료비": {"type": "aggregate", "key": "항암방사선약물치료비"},
     "표적항암약물치료비": {"type": "aggregate", "key": "표적항암약물치료비"},
     "양성자방사선치료비": {"type": "direct", "keywords": [
@@ -790,6 +840,7 @@ MATCHING_RULES = {
     "세기조절방사선치료비": {"type": "direct", "keywords": [
         "세기조절방사선치료비", "항암세기조절방사선치료",
         "항암방사선(세기조절)",  # 현대해상: 항암방사선(세기조절)치료
+        "표적항암방사선치료비(항암세기조절방사선)",  # DB손해: 표적항암방사선치료비(항암세기조절방사선)
     ]},
     "면역항암약물치료비": {"type": "direct", "keywords": [
         "면역항암약물치료비", "특정면역항암약물허가치료",
