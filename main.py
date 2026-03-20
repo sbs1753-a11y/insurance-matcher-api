@@ -35,7 +35,7 @@ app.add_middleware(
 INSURER_NAMES = {
     "meritz": "메리츠화재", "samsung": "삼성화재",
     "samsung_life": "삼성생명",
-    "kb": "KB손해보험", "db": "DB손해보험",
+    "kb": "KB손해보험", "db": "DB손해",
     "mirae": "미래에셋생명", "abl": "ABL생명",
     "heungkuk": "흥국생명", "hanwha": "한화생명",
     "hyundai": "현대해상", "lotte": "롯데손해보험",

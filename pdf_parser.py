@@ -1852,7 +1852,7 @@ def parse_pdf_all_in_one(pdf_path):
     insurer_name_map = {
         "meritz": "메리츠화재", "samsung": "삼성화재",
         "samsung_life": "삼성생명", "kb": "KB손해보험",
-        "db": "DB손해보험", "mirae": "미래에셋생명",
+        "db": "DB손해", "mirae": "미래에셋생명",
         "abl": "ABL생명", "heungkuk": "흥국생명",
         "hanwha": "한화생명", "hyundai": "현대해상",
         "lotte": "롯데손해보험", "nh": "NH농협생명",
@@ -1994,8 +1994,10 @@ def _detect_product_name_from_text(page_texts):
             if db_match and 'idbins' not in line.lower() and '프로미라이프' not in line:
                 name = db_match.group(1).strip()
                 name = re.sub(r'\(무배당\).*', '', name).strip()
-                if len(name) > 4 and '보험' in name:
-                    return name[:50] if len(name) > 50 else name
+                # "종합보험2601" 등에서 "종합보험" + 숫자코드 제거 → 핵심 상품명만 추출
+                name = re.sub(r'\s*(종합보험|건강보험|보장보험|질병보험)\d*$', '', name).strip()
+                if len(name) > 2:
+                    return name[:30] if len(name) > 30 else name
 
             # 현대해상: "무배당현대해상퍼펙트플러스종합보험(연만기갱신형)(Hi2601)" 패턴
             hyundai_match = re.search(r'(?:무배당)?현대해상(.+?종합보험|.+?보험)(?:\([^)]*\))', line)
