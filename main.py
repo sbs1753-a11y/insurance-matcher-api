@@ -14,6 +14,10 @@ from excel_handler import (
     write_insurer_info, write_premium, find_structure
 )
 from matcher import match_coverages
+from hira_pdf_parser import (
+    parse_basic_care_pdf, parse_prescription_pdf,
+    parse_detail_care_pdf, detect_hira_pdf_type
+)
 
 app = FastAPI(title="보험 보장분석 자동매칭 API", version="1.0.0")
 
@@ -85,6 +89,82 @@ async def parse_pdf(pdf_file: UploadFile = File(...)):
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+@app.post("/api/parse-hira-pdf")
+async def parse_hira_pdf(
+    files: List[UploadFile] = File(...),
+):
+    """심평원 PDF (기본진료/처방조제/세부진료) → JSON 변환
+    
+    1~3개 PDF를 업로드하면 자동으로 유형을 감지하여 파싱합니다.
+    프론트엔드 Excel 파서와 동일한 JSON 형식으로 반환합니다.
+    """
+    tmp_paths = []
+    try:
+        result = {
+            "success": True,
+            "treatRecords": [],
+            "rxRecords": [],
+            "detailRecords": [],
+            "detected_types": [],
+            "file_count": len(files),
+        }
+        
+        for f in files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                content = await f.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+                tmp_paths.append(tmp_path)
+            
+            # 파일명 또는 내용 기반 유형 감지
+            filename_lower = (f.filename or '').lower().replace(' ', '')
+            
+            if '기본진료' in filename_lower:
+                pdf_type = 'basic'
+            elif '처방조제' in filename_lower:
+                pdf_type = 'prescription'
+            elif '세부진료' in filename_lower:
+                pdf_type = 'detail'
+            else:
+                # 파일명으로 판별 불가 시 내용 기반 감지
+                pdf_type = detect_hira_pdf_type(tmp_path)
+            
+            result["detected_types"].append({
+                "filename": f.filename,
+                "type": pdf_type,
+            })
+            
+            if pdf_type == 'basic':
+                records = parse_basic_care_pdf(tmp_path)
+                result["treatRecords"] = records
+            elif pdf_type == 'prescription':
+                records = parse_prescription_pdf(tmp_path)
+                result["rxRecords"] = records
+            elif pdf_type == 'detail':
+                records = parse_detail_care_pdf(tmp_path)
+                result["detailRecords"] = records
+            else:
+                result["detected_types"][-1]["warning"] = "유형 감지 실패 — 파일을 확인해주세요."
+        
+        result["summary"] = {
+            "treat_count": len(result["treatRecords"]),
+            "rx_count": len(result["rxRecords"]),
+            "detail_count": len(result["detailRecords"]),
+        }
+        
+        return result
+    
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e), "traceback": traceback.format_exc()}
+        )
+    finally:
+        for p in tmp_paths:
+            if os.path.exists(p):
+                os.unlink(p)
 
 
 @app.post("/api/match-with-summary")
