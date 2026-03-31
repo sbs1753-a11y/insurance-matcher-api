@@ -250,7 +250,8 @@ def extract_coverage_kb(pdf_path):
     full_text = ""
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        max_pages = min(len(pdf.pages), 15)
+        for page in pdf.pages[:max_pages]:
             page_text = page.extract_text()
             if page_text:
                 full_text += page_text + "\n"
@@ -438,11 +439,12 @@ def extract_coverage_mirae(pdf_path):
 
     pdf = pdfplumber.open(pdf_path)
     try:
-        # 1단계: 전체 페이지 텍스트 캐시 (1회 오픈)
+        # 1단계: 필요 페이지만 텍스트 캐시 (최대 20페이지 — 보장 테이블은 앞쪽에 위치)
         overview_text = ""
         all_page_texts = []
-        for i, page in enumerate(pdf.pages):
-            page_text = page.extract_text()
+        max_pages = min(len(pdf.pages), 20)
+        for i in range(max_pages):
+            page_text = pdf.pages[i].extract_text()
             all_page_texts.append(page_text or "")
             if i < 7 and page_text and ("보험종류" in page_text or "보험가입금액" in page_text):
                 overview_text += page_text + "\n"
@@ -866,7 +868,8 @@ def extract_coverage_samsung(pdf_path):
 
     with pdfplumber.open(pdf_path) as pdf:
         full_text = ""
-        for page in pdf.pages:
+        max_pages = min(len(pdf.pages), 15)  # 보장 목록은 앞 15페이지 안에 위치
+        for page in pdf.pages[:max_pages]:
             page_text = page.extract_text()
             if page_text:
                 full_text += page_text + "\n"
@@ -957,7 +960,9 @@ def extract_coverage_samsung_table(pdf_path):
     results = []
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+        max_pages = min(len(pdf.pages), 15)  # 보장 테이블은 앞 15페이지 안에 위치
+        for page_num in range(max_pages):
+            page = pdf.pages[page_num]
             text = page.extract_text()
             if not text:
                 continue
@@ -1203,7 +1208,35 @@ def _extract_heungkuk_surgery_grade_detail(pdf_path):
     return grade_results
 
 
-def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path):
+def _extract_heungkuk_surgery_grade_detail_cached(page_texts):
+    """흥국생명 1~5종 재해수술 종별 금액 추출 — 캐시 텍스트 사용 (PDF 재오픈 없음)"""
+    grade_results = []
+    try:
+        start_page = min(14, len(page_texts))
+        max_page = min(30, len(page_texts))
+        for i in range(start_page, max_page):
+            text = page_texts[i] if i < len(page_texts) else ""
+            if not text:
+                continue
+            if '재해수술' not in text or '수술분류표' not in text:
+                continue
+            grade_amounts = re.findall(r'(\d)종\s+(\d[\d,]*만원)', text)
+            if len(grade_amounts) >= 3:
+                for grade_str, amount_str in grade_amounts:
+                    grade = int(grade_str)
+                    if 1 <= grade <= 5:
+                        amount = parse_amount(amount_str)
+                        if amount:
+                            name = f"[재해]{grade}종수술"
+                            grade_results.append({"특약명": name, "가입금액": amount})
+                if grade_results:
+                    break
+    except Exception:
+        pass
+    return grade_results
+
+
+def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path, page_texts_fast=None):
     """흥국생명 - 캐시된 테이블에서 추출 (parse_pdf_all_in_one 전용)"""
     results = []
     
@@ -1229,12 +1262,13 @@ def _extract_coverage_heungkuk_from_cache(page_texts, page_tables, pdf_path):
                 if not any(existing["특약명"] == r["특약명"] for existing in results):
                     results.append(r)
     
-    # 3차: 1~5종 재해수술 종별 세부금액 추출 (보장내용 상세 페이지에서)
-    if pdf_path:
-        surgery_details = _extract_heungkuk_surgery_grade_detail(pdf_path)
-        for r in surgery_details:
-            if not any(existing["특약명"] == r["특약명"] for existing in results):
-                results.append(r)
+    # 3차: 1~5종 재해수술 종별 세부금액 추출 — 캐시 텍스트 사용 (PDF 재오픈 없음)
+    # page_texts_fast(PyMuPDF)는 전체 페이지를 포함하므로 수술등급 페이지(14~30)에 접근 가능
+    texts_for_surgery = page_texts_fast if page_texts_fast else page_texts
+    surgery_details = _extract_heungkuk_surgery_grade_detail_cached(texts_for_surgery)
+    for r in surgery_details:
+        if not any(existing["특약명"] == r["특약명"] for existing in results):
+            results.append(r)
     
     return results
 
@@ -1959,7 +1993,8 @@ def parse_pdf_all_in_one(pdf_path):
         # 흥국생명 전용 파서 — 테이블 기반 (실제 PDF 구조에 맞춤)
         coverages = _extract_coverage_heungkuk_from_cache(
             page_texts if any(page_texts) else page_texts_fast,
-            page_tables, pdf_path
+            page_tables, pdf_path,
+            page_texts_fast=page_texts_fast  # 수술등급 캐시용 전체 텍스트
         )
         # 캐시 결과 없으면 pdfplumber로 페이지 5~14만 처리 (전체 PDF 재오픈 금지)
         if not coverages:
@@ -2398,7 +2433,9 @@ def extract_coverage_generic(pdf_path):
     sub_prefix_pattern = re.compile(r'^┗?\s*\d+\s+')
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+        max_pages = min(len(pdf.pages), 20)  # 보장 테이블은 앞 20페이지 안에 위치
+        for page_num in range(max_pages):
+            page = pdf.pages[page_num]
             text = page.extract_text()
             if not text:
                 continue
