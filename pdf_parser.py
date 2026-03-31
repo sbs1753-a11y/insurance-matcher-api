@@ -1,3 +1,4 @@
+import gc
 import pdfplumber
 import re
 import signal
@@ -20,23 +21,31 @@ def _pymupdf_extract_texts_safe(pdf_path, timeout_sec=15):
     error_container = [None]
 
     def _worker():
+        doc = None
         try:
             doc = _fitz.open(pdf_path)
             texts = []
             for page in doc:
                 texts.append(page.get_text() or "")
-            doc.close()
             result_container[0] = texts
         except Exception as e:
             error_container[0] = e
+        finally:
+            if doc:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     t.join(timeout=timeout_sec)
 
     if t.is_alive():
-        # 타임아웃 — PyMuPDF hang
+        # 타임아웃 — PyMuPDF hang (daemon thread will be GC'd)
         print(f"[WARN] PyMuPDF timed out ({timeout_sec}s) for {pdf_path}, falling back to pdfplumber")
+        result_container[0] = None
+        gc.collect()
         return None
     if error_container[0]:
         print(f"[WARN] PyMuPDF error: {error_container[0]}, falling back to pdfplumber")
@@ -46,12 +55,15 @@ def _pymupdf_extract_texts_safe(pdf_path, timeout_sec=15):
 
 def detect_insurer(pdf_path):
     """PDF에서 보험사 자동 감지"""
-    with pdfplumber.open(pdf_path) as pdf:
+    pdf = pdfplumber.open(pdf_path)
+    try:
         text = ""
         for page in pdf.pages[:3]:
             page_text = page.extract_text()
             if page_text:
                 text += page_text
+    finally:
+        pdf.close()
 
     keywords_ordered = [
         ("삼성생명", "samsung_life"),
@@ -107,7 +119,8 @@ def detect_insurer(pdf_path):
 
 def detect_product_name(pdf_path):
     """PDF에서 상품명 추출"""
-    with pdfplumber.open(pdf_path) as pdf:
+    pdf = pdfplumber.open(pdf_path)
+    try:
         for page in pdf.pages[:10]:
             text = page.extract_text()
             if not text:
@@ -172,12 +185,15 @@ def detect_product_name(pdf_path):
                         name = name[:30]
                     return name
 
+    finally:
+        pdf.close()
     return "상품명 미확인"
 
 
 def extract_premium(pdf_path):
     """PDF에서 보험료 추출 (원 단위)"""
-    with pdfplumber.open(pdf_path) as pdf:
+    pdf = pdfplumber.open(pdf_path)
+    try:
         for page in pdf.pages[:7]:
             text = page.extract_text()
             if not text:
@@ -199,6 +215,8 @@ def extract_premium(pdf_path):
                     val = int(amount_str)
                     if val >= 1000:
                         return val
+    finally:
+        pdf.close()
     return None
 
 
@@ -413,52 +431,54 @@ def _enrich_kb_injury_grade_info(results, full_text):
 # ══════════════════════════════════════════════
 
 def extract_coverage_mirae(pdf_path):
-    """미래에셋생명 PDF 파싱 — 보험계약 개요 페이지에서 추출"""
+    """미래에셋생명 PDF 파싱 — 보험계약 개요 페이지에서 추출
+    최적화: PDF를 1회만 열어 모든 정보 추출 (기존 4~5회 → 1회)
+    """
     results = []
 
-    with pdfplumber.open(pdf_path) as pdf:
+    pdf = pdfplumber.open(pdf_path)
+    try:
+        # 1단계: 전체 페이지 텍스트 캐시 (1회 오픈)
         overview_text = ""
-        for page in pdf.pages[:7]:
+        all_page_texts = []
+        for i, page in enumerate(pdf.pages):
             page_text = page.extract_text()
-            if page_text and ("보험종류" in page_text or "보험가입금액" in page_text):
+            all_page_texts.append(page_text or "")
+            if i < 7 and page_text and ("보험종류" in page_text or "보험가입금액" in page_text):
                 overview_text += page_text + "\n"
 
-    if not overview_text:
-        with pdfplumber.open(pdf_path) as pdf:
-            overview_text = ""
-            for page in pdf.pages[:7]:
-                page_text = page.extract_text()
-                if page_text:
-                    overview_text += page_text + "\n"
+        if not overview_text:
+            overview_text = "\n".join(all_page_texts[:7])
 
-    lines = overview_text.split('\n')
-    person_name = _detect_person_name(lines)
-    results = _parse_mirae_blocks(lines, person_name)
+        lines = overview_text.split('\n')
+        person_name = _detect_person_name(lines)
+        results = _parse_mirae_blocks(lines, person_name)
 
-    if not results:
-        results = _parse_mirae_benefit_section(pdf_path)
+        if not results:
+            results = _parse_mirae_benefit_section_cached(all_page_texts[:15])
 
-    main_info = _detect_main_contract_benefit(pdf_path)
+        main_info = _detect_main_contract_benefit_cached(all_page_texts[:15])
+        if main_info:
+            benefit_name = main_info["benefit_name"]
+            found_main = False
+            for r in results:
+                if "주계약" in r["특약명"]:
+                    r["특약명"] = benefit_name
+                    found_main = True
+                    break
+            if not found_main and main_info["amount"]:
+                results.append({
+                    "특약명": benefit_name,
+                    "가입금액": main_info["amount"]
+                })
 
-    if main_info:
-        benefit_name = main_info["benefit_name"]
-        found_main = False
-        for r in results:
-            if "주계약" in r["특약명"]:
-                r["특약명"] = benefit_name
-                found_main = True
-                break
-        if not found_main and main_info["amount"]:
-            results.append({
-                "특약명": benefit_name,
-                "가입금액": main_info["amount"]
-            })
-
-    # 1-7종수술 종별 세부금액 추출 (보장내역 상세 페이지에서)
-    surgery_details = _extract_mirae_surgery_grade_detail(pdf_path)
-    for r in surgery_details:
-        if not any(existing["특약명"] == r["특약명"] for existing in results):
-            results.append(r)
+        surgery_details = _extract_mirae_surgery_grade_detail_cached(all_page_texts)
+        for r in surgery_details:
+            if not any(existing["특약명"] == r["특약명"] for existing in results):
+                results.append(r)
+    finally:
+        pdf.close()
+        del all_page_texts
 
     return results
 
@@ -656,6 +676,105 @@ def _map_main_benefit_name(benefit_raw):
         if key in benefit_clean:
             return value
     return f"주계약({benefit_raw})"
+
+
+
+
+def _detect_main_contract_benefit_cached(page_texts):
+    """미래에셋 PDF 보장내역 섹션에서 주계약의 실제 보장내용과 금액 감지 (캐시된 텍스트 사용)"""
+    for text in page_texts:
+        if not text:
+            continue
+        if "주계약 보장내역" not in text:
+            continue
+
+        lines = text.split('\n')
+        in_main_section = False
+        benefit_name = None
+        amount = None
+
+        for idx, line in enumerate(lines):
+            line_clean = re.sub(r'^#+\s*', '', line.strip()).strip()
+            if "주계약 보장내역" in line_clean:
+                in_main_section = True
+                continue
+            if "선택특약 보장내역" in line_clean:
+                break
+            if not in_main_section:
+                continue
+
+            bracket_match = re.search(r'\[([^\]]+보험금[^\]]*)\]', line_clean)
+            if bracket_match:
+                benefit_raw = bracket_match.group(1).strip()
+                benefit_name = _map_main_benefit_name(benefit_raw)
+
+            if benefit_name and amount is None:
+                amount_match = re.search(r'(\d[\d,]*)\s*만원', line_clean)
+                if amount_match:
+                    amount = int(amount_match.group(1).replace(',', '')) * 10000
+
+            if benefit_name and amount:
+                return {"benefit_name": benefit_name, "amount": amount}
+
+    return None
+
+
+def _parse_mirae_benefit_section_cached(page_texts):
+    """미래에셋 PDF 보장내역 섹션에서 지급금액 기반 추출 (캐시된 텍스트 사용)"""
+    results = []
+    for text in page_texts:
+        if not text:
+            continue
+        if "보장내역" not in text and "지급사유" not in text:
+            continue
+
+        lines = text.split('\n')
+        current_name = None
+
+        for line in lines:
+            line_clean = re.sub(r'^#+\s*', '', line.strip()).strip()
+            if any(kw in line_clean for kw in ["특약", "주계약"]) and "대상" not in line_clean:
+                current_name = _clean_mirae_coverage_name(line_clean)
+
+            amount_match = re.search(r'(\d[\d,]*)\s*만원', line_clean)
+            if amount_match and current_name:
+                val = int(amount_match.group(1).replace(',', ''))
+                amount = val * 10000
+                if amount > 0 and len(current_name) >= 2:
+                    if "납입면제" not in current_name:
+                        if not any(r["특약명"] == current_name for r in results):
+                            results.append({"특약명": current_name, "가입금액": amount})
+                current_name = None
+
+    return results
+
+
+def _extract_mirae_surgery_grade_detail_cached(page_texts):
+    """미래에셋 PDF 보장내역에서 1-7종수술 종별 상세 금액 추출 (캐시된 텍스트 사용)"""
+    grade_results = []
+    try:
+        max_page = min(len(page_texts), 25)
+        for i in range(14, max_page):  # 15페이지부터
+            text = page_texts[i]
+            if not text or '1-7종수술' not in text:
+                continue
+
+            grade_amounts = re.findall(r'(\d)종\s+(\d[\d,]*만원)', text)
+            for grade_str, amount_str in grade_amounts:
+                grade = int(grade_str)
+                if 1 <= grade <= 7:
+                    amount = parse_amount(amount_str)
+                    if amount:
+                        name = f"[1-7종]{grade}종수술"
+                        if not any(r["특약명"] == name for r in grade_results):
+                            grade_results.append({
+                                "특약명": name,
+                                "가입금액": amount
+                            })
+    except Exception:
+        pass
+
+    return grade_results
 
 
 def _extract_mirae_surgery_grade_detail(pdf_path):

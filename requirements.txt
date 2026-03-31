@@ -5,3 +5,4 @@ PyMuPDF
 openpyxl
 rapidfuzz
 python-multipart
+psutil

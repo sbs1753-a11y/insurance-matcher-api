@@ -1,7 +1,9 @@
 import os
+import gc
 import tempfile
 import shutil
 import traceback
+import psutil
 from urllib.parse import quote
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +21,7 @@ from hira_pdf_parser import (
     parse_detail_care_pdf, detect_hira_pdf_type
 )
 
-app = FastAPI(title="보험 보장분석 자동매칭 API", version="1.0.0")
+app = FastAPI(title="보험 보장분석 자동매칭 API", version="1.1.0")
 
 # CORS 설정 — 프론트엔드 도메인 허용
 app.add_middleware(
@@ -47,15 +49,68 @@ INSURER_NAMES = {
     "kyobo": "교보생명", "shinhan": "신한라이프",
 }
 
+# ── 메모리 관리 유틸리티 ──
+
+def _get_memory_mb():
+    """현재 프로세스 메모리 사용량 (MB)"""
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except Exception:
+        return -1
+
+
+def _force_gc():
+    """강제 가비지 컬렉션 — PDF/Excel 처리 후 메모리 해제"""
+    gc.collect()
+
+
+def _cleanup_temp_files(paths):
+    """임시파일 안전 삭제"""
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.unlink(p)
+        except Exception:
+            pass
+
+
+def _cleanup_stale_temp_files():
+    """오래된 임시파일 정리 (1시간 이상 된 .pdf/.xlsx 파일)"""
+    import time
+    tmp_dir = tempfile.gettempdir()
+    cutoff = time.time() - 3600  # 1시간
+    try:
+        for fname in os.listdir(tmp_dir):
+            if fname.endswith(('.pdf', '.xlsx')):
+                fpath = os.path.join(tmp_dir, fname)
+                try:
+                    if os.path.getmtime(fpath) < cutoff:
+                        os.unlink(fpath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "보험 보장분석 자동매칭 API", "version": "1.0.0"}
+    mem_mb = _get_memory_mb()
+    return {
+        "status": "ok",
+        "service": "보험 보장분석 자동매칭 API",
+        "version": "1.1.0",
+        "memory_mb": round(mem_mb, 1),
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    mem_mb = _get_memory_mb()
+    return {
+        "status": "ok",
+        "memory_mb": round(mem_mb, 1),
+    }
 
 
 @app.post("/api/parse-pdf")
@@ -67,11 +122,13 @@ async def parse_pdf(pdf_file: UploadFile = File(...)):
             content = await pdf_file.read()
             tmp.write(content)
             tmp_path = tmp.name
+        # content 참조 즉시 해제
+        del content
 
         # 최적화: parse_pdf_all_in_one으로 PDF를 1회만 열어서 전체 정보 추출
         pdf_info = parse_pdf_all_in_one(tmp_path)
 
-        return {
+        response = {
             "success": True,
             "filename": pdf_file.filename,
             "insurer_code": pdf_info["insurer_code"],
@@ -81,14 +138,16 @@ async def parse_pdf(pdf_file: UploadFile = File(...)):
             "coverages": pdf_info["coverages"],
             "coverage_count": len(pdf_info["coverages"]),
         }
+        del pdf_info
+        return response
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": str(e), "traceback": traceback.format_exc()}
         )
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        _cleanup_temp_files([tmp_path])
+        _force_gc()
 
 
 @app.post("/api/parse-hira-pdf")
@@ -117,6 +176,7 @@ async def parse_hira_pdf(
                 tmp.write(content)
                 tmp_path = tmp.name
                 tmp_paths.append(tmp_path)
+            del content
             
             # 파일명 또는 내용 기반 유형 감지
             filename_lower = (f.filename or '').lower().replace(' ', '')
@@ -162,9 +222,8 @@ async def parse_hira_pdf(
             content={"success": False, "error": str(e), "traceback": traceback.format_exc()}
         )
     finally:
-        for p in tmp_paths:
-            if os.path.exists(p):
-                os.unlink(p)
+        _cleanup_temp_files(tmp_paths)
+        _force_gc()
 
 
 @app.post("/api/match-with-summary")
@@ -185,6 +244,7 @@ async def match_with_summary(
             content = await excel_file.read()
             tmp.write(content)
             excel_path = tmp.name
+        del content
 
         sn = sheet_name if sheet_name else None
 
@@ -206,6 +266,7 @@ async def match_with_summary(
                 tmp.write(content)
                 tmp_path = tmp.name
                 tmp_pdf_paths.append(tmp_path)
+            del content
 
             # PDF 파싱 (통합 1회 오픈)
             pdf_info = parse_pdf_all_in_one(tmp_path)
@@ -214,6 +275,15 @@ async def match_with_summary(
             product_name = pdf_info["product_name"]
             premium = pdf_info["premium"]
             pdf_coverages = pdf_info["coverages"]
+            # pdf_info의 나머지 데이터는 더 이상 필요 없으므로 삭제
+            del pdf_info
+
+            # PDF 임시파일 즉시 삭제 (매칭 전에 메모리 확보)
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
 
             # Excel에서 특약명 읽기
             excel_coverages = read_excel_coverages(
@@ -261,6 +331,10 @@ async def match_with_summary(
                 ],
             })
 
+            # 매칭 완료 후 중간 데이터 해제
+            del pdf_coverages, excel_coverages, result, matched
+            _force_gc()
+
         return {
             "success": True,
             "customer_name": customer_name,
@@ -275,11 +349,8 @@ async def match_with_summary(
             content={"success": False, "error": str(e), "traceback": traceback.format_exc()}
         )
     finally:
-        if excel_path and os.path.exists(excel_path):
-            os.unlink(excel_path)
-        for p in tmp_pdf_paths:
-            if os.path.exists(p):
-                os.unlink(p)
+        _cleanup_temp_files([excel_path] + tmp_pdf_paths)
+        _force_gc()
 
 
 @app.post("/api/match")
@@ -301,6 +372,7 @@ async def match_and_download(
             content = await excel_file.read()
             tmp.write(content)
             excel_path = tmp.name
+        del content
 
         output_path = excel_path.replace(".xlsx", "_result.xlsx")
         shutil.copy2(excel_path, output_path)
@@ -322,12 +394,22 @@ async def match_and_download(
                 tmp.write(content)
                 tmp_path = tmp.name
                 tmp_pdf_paths.append(tmp_path)
+            del content
 
             # PDF 파싱 (통합 1회 오픈)
             pdf_info = parse_pdf_all_in_one(tmp_path)
             insurer_display = pdf_info["insurer_name"]
             product_name = pdf_info["product_name"]
             premium = pdf_info["premium"]
+            pdf_coverages = pdf_info["coverages"]
+            del pdf_info
+
+            # PDF 임시파일 즉시 삭제
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
 
             # 보험사명, 상품명 기록
             write_insurer_info(
@@ -346,7 +428,6 @@ async def match_and_download(
                 )
 
             # 특약 추출 및 매칭
-            pdf_coverages = pdf_info["coverages"]
             excel_coverages = read_excel_coverages(
                 output_path, sn, 2, current_amount_col, start_row
             )
@@ -363,6 +444,10 @@ async def match_and_download(
                 } for m in matched]
                 write_matched_amounts(output_path, output_path, write_data, sn)
 
+            # 중간 데이터 해제
+            del pdf_coverages, excel_coverages, result, matched
+            _force_gc()
+
         # 결과 파일명
         filename = "보장분석표_매칭결과.xlsx"
         if customer_name:
@@ -372,12 +457,18 @@ async def match_and_download(
         encoded_filename = quote(filename)
 
         def file_iterator(path):
-            with open(path, "rb") as f:
-                while chunk := f.read(65536):
-                    yield chunk
-            # 스트리밍 완료 후 임시파일 삭제
-            if os.path.exists(path):
-                os.unlink(path)
+            try:
+                with open(path, "rb") as f:
+                    while chunk := f.read(65536):
+                        yield chunk
+            finally:
+                # 스트리밍 완료 후 임시파일 삭제
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except Exception:
+                    pass
+                _force_gc()
 
         return StreamingResponse(
             file_iterator(output_path),
@@ -391,17 +482,19 @@ async def match_and_download(
     except Exception as e:
         # 오류 시 output_path 정리
         if output_path and os.path.exists(output_path):
-            os.unlink(output_path)
+            try:
+                os.unlink(output_path)
+            except Exception:
+                pass
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": str(e), "traceback": traceback.format_exc()}
         )
     finally:
-        if excel_path and os.path.exists(excel_path):
-            os.unlink(excel_path)
-        for p in tmp_pdf_paths:
-            if os.path.exists(p):
-                os.unlink(p)
+        _cleanup_temp_files([excel_path] + tmp_pdf_paths)
+        _force_gc()
+        # 주기적으로 오래된 임시파일 정리
+        _cleanup_stale_temp_files()
         # Note: output_path is cleaned up inside file_iterator after streaming
 
 
