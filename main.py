@@ -208,10 +208,19 @@ async def parse_hira_pdf(
             else:
                 result["detected_types"][-1]["warning"] = "유형 감지 실패 — 파일을 확인해주세요."
         
+        # 금액 합계 계산 (청구금 계산용)
+        treat_recs = result["treatRecords"]
+        total_cost_sum = sum(r.get('총진료비', 0) for r in treat_recs)
+        self_cost_sum = sum(r.get('본인부담금', 0) for r in treat_recs)
+        insurer_cost_sum = sum(r.get('건강보험혜택', 0) for r in treat_recs)
+        
         result["summary"] = {
-            "treat_count": len(result["treatRecords"]),
+            "treat_count": len(treat_recs),
             "rx_count": len(result["rxRecords"]),
             "detail_count": len(result["detailRecords"]),
+            "total_cost_sum": total_cost_sum,
+            "self_cost_sum": self_cost_sum,
+            "insurer_cost_sum": insurer_cost_sum,
         }
         
         return result

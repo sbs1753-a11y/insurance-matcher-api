@@ -93,7 +93,7 @@ def parse_basic_care_pdf(pdf_path):
     """기본진료내역 PDF → treatRecords JSON
     
     PDF 컬럼: 순번 | 진료시작일 | 병·의원&약국 | 진단과 | 입원/외래 | 주상병코드 | 주상병명 | 내원일수 | 총진료비 | 건강보험혜택 | 내가낸의료비
-    출력 형식: { 진료일자, 진료기관명, 진단코드, 진단명, 입원외래, 내원일수 }
+    출력 형식: { 진료일자, 진료기관명, 진단코드, 진단명, 입원외래, 내원일수, 총진료비, 건강보험혜택, 본인부담금 }
     """
     all_rows = _extract_all_tables(pdf_path)
     if not all_rows:
@@ -124,8 +124,12 @@ def parse_basic_care_pdf(pdf_path):
             col_map['name'] = i
         elif '내원' in h_clean and '일수' in h_clean:
             col_map['days'] = i
-        elif '내가낸' in h_clean or '내가 낸' in h_clean or '진료비' in h_clean:
-            col_map['cost'] = i
+        elif '총진료비' in h_clean or '요양급여비용총액' in h_clean or ('요양급여' in h_clean and '총액' in h_clean):
+            col_map['total_cost'] = i
+        elif '건강보험' in h_clean or '혜택받은' in h_clean or '공단부담' in h_clean or '보험자부담' in h_clean:
+            col_map['insurer_cost'] = i
+        elif '내가낸' in h_clean or '내가 낸' in h_clean or '본인부담' in h_clean or '환자부담' in h_clean:
+            col_map['self_cost'] = i
     
     # 폴백: 고정 위치 (표준 심평원 양식)
     if 'date' not in col_map:
@@ -140,6 +144,12 @@ def parse_basic_care_pdf(pdf_path):
         col_map['name'] = 6
     if 'days' not in col_map:
         col_map['days'] = 7
+    if 'total_cost' not in col_map:
+        col_map['total_cost'] = 8
+    if 'insurer_cost' not in col_map:
+        col_map['insurer_cost'] = 9
+    if 'self_cost' not in col_map:
+        col_map['self_cost'] = 10
     
     records = []
     for row in all_rows[header_idx + 1:]:
@@ -162,6 +172,9 @@ def parse_basic_care_pdf(pdf_path):
             '진단명': _clean(row[col_map['name']] if col_map['name'] < len(row) else ''),
             '입원외래': inout,
             '내원일수': _parse_int(row[col_map['days']] if col_map['days'] < len(row) else 0),
+            '총진료비': _parse_int(row[col_map['total_cost']] if col_map['total_cost'] < len(row) else 0),
+            '건강보험혜택': _parse_int(row[col_map['insurer_cost']] if col_map['insurer_cost'] < len(row) else 0),
+            '본인부담금': _parse_int(row[col_map['self_cost']] if col_map['self_cost'] < len(row) else 0),
         })
     
     # 날짜 역순 정렬
