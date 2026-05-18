@@ -30,7 +30,11 @@ def find_insurer_row(excel_path, sheet_name=None, search_col=2):
 
 
 def find_structure(excel_path, sheet_name=None, search_col=2):
-    """엑셀 보장분석표 구조 자동 탐지"""
+    """엑셀 보장분석표 구조 자동 탐지 (A형 + B형 지원)
+    
+    A형: B열에 "회사", "상품", "보험료" + 특약명 B열 + 금액 D열~
+    B형: C열에 "보험사", "상품명", "보험료" + 특약명 B열 + 금액 E열~
+    """
     wb = openpyxl.load_workbook(excel_path)
     try:
         ws = wb[sheet_name] if sheet_name else wb.active
@@ -41,9 +45,14 @@ def find_structure(excel_path, sheet_name=None, search_col=2):
             "premium_row": None,
             "reserve_row": None,
             "start_row": None,
+            # 양식 타입 및 열 정보
+            "template_type": "A",    # "A" 또는 "B"
+            "coverage_col": 2,       # 특약명 열 (둘 다 B열=2)
+            "first_amount_col": 4,   # 첫 번째 금액 열 (A형=D/4, B형=E/5)
         }
 
-        for row_idx in range(1, ws.max_row + 1):
+        # --- 1단계: A형 탐지 (B열=column 2 기준) ---
+        for row_idx in range(1, min(ws.max_row + 1, 20)):
             val = ws.cell(row=row_idx, column=search_col).value
             if val is None:
                 continue
@@ -63,6 +72,54 @@ def find_structure(excel_path, sheet_name=None, search_col=2):
         if structure["start_row"] is None and structure["premium_row"]:
             structure["start_row"] = structure["premium_row"] + 3
 
+        # A형 탐지 성공: insurer_row 또는 premium_row가 있으면 A형
+        if structure["insurer_row"] or structure["premium_row"]:
+            structure["template_type"] = "A"
+            structure["coverage_col"] = 2
+            structure["first_amount_col"] = 4
+            return structure
+
+        # --- 2단계: B형 탐지 (C열=column 3 기준) ---
+        # B형: C열에 "보험사", "상품명", "월 보험료" 등이 있고, E열~에 데이터
+        for row_idx in range(1, min(ws.max_row + 1, 20)):
+            val_c = ws.cell(row=row_idx, column=3).value  # C열
+            if val_c is None:
+                continue
+            val_str = str(val_c).strip()
+
+            if ("보험사" in val_str or "회사" in val_str) and structure["insurer_row"] is None:
+                structure["insurer_row"] = row_idx
+            if "상품" in val_str and structure["product_row"] is None:
+                structure["product_row"] = row_idx
+            if "보험료" in val_str and "총" not in val_str and structure["premium_row"] is None:
+                structure["premium_row"] = row_idx
+
+        # B형 start_row 탐지: A열에 "분류" 또는 B열에 "보장내용"이 있는 헤더 행의 다음 행
+        for row_idx in range(1, min(ws.max_row + 1, 20)):
+            val_a = ws.cell(row=row_idx, column=1).value
+            val_b = ws.cell(row=row_idx, column=2).value
+            a_str = str(val_a).strip() if val_a else ""
+            b_str = str(val_b).strip() if val_b else ""
+
+            if ("분류" in a_str and "보장" in b_str) or ("분류" in b_str):
+                structure["start_row"] = row_idx + 1
+                break
+
+        # B형 폴백: premium_row 기준
+        if structure["start_row"] is None and structure["premium_row"]:
+            structure["start_row"] = structure["premium_row"] + 2
+
+        # B형이면 타입 마킹
+        if structure["insurer_row"] or structure["premium_row"] or structure["start_row"]:
+            structure["template_type"] = "B"
+            structure["coverage_col"] = 2       # B열 = 특약명 (사용자가 B열로 이동함)
+            structure["first_amount_col"] = 5   # E열 = 첫 번째 보험사 금액
+        else:
+            # 완전 탐지 실패 — 기본값 사용
+            structure["template_type"] = "unknown"
+            structure["coverage_col"] = 2
+            structure["first_amount_col"] = 4
+
         return structure
     finally:
         wb.close()
@@ -77,8 +134,13 @@ def read_excel_coverages(excel_path, sheet_name=None, coverage_col=2, amount_col
         coverages = []
         skip_values = [
             "주계약", "특약", "합계", "총보험료", "보장항목",
-            "담보명", "특약명", ""
+            "담보명", "특약명", "보장내용", "분류", ""
         ]
+        # 분류명만 있는 셀 스킵 (B형에서 A열의 분류가 B열에 혼재할 경우 대비)
+        category_only = {
+            "실손", "수술", "암", "뇌", "심장", "입원", "간호",
+            "후유", "사망", "상해", "치매", "운전", "배상"
+        }
 
         for row_idx in range(start_row, ws.max_row + 1):
             cell_value = ws.cell(row=row_idx, column=coverage_col).value
@@ -92,6 +154,10 @@ def read_excel_coverages(excel_path, sheet_name=None, coverage_col=2, amount_col
                 continue
 
             if len(name) < 2:
+                continue
+
+            # 분류명만 단독으로 있는 행 스킵
+            if name in category_only:
                 continue
 
             coverages.append({

@@ -257,17 +257,21 @@ async def match_with_summary(
 
         sn = sheet_name if sheet_name else None
 
-        # 구조 자동 탐지
+        # 구조 자동 탐지 (A형/B형 자동 분기)
         structure = find_structure(excel_path, sn, 2)
-        insurer_name_row = structure["insurer_row"] or 4
-        product_name_row = structure["product_row"] or 5
-        premium_row = structure["premium_row"] or 6
-        start_row = structure["start_row"] or 8
+        template_type = structure.get("template_type", "A")
+        coverage_col = structure.get("coverage_col", 2)
+        first_amount_col = structure.get("first_amount_col", 4)
+
+        insurer_name_row = structure["insurer_row"] or (4 if template_type == "A" else 5)
+        product_name_row = structure["product_row"] or (5 if template_type == "A" else 6)
+        premium_row = structure["premium_row"] or (6 if template_type == "A" else 9)
+        start_row = structure["start_row"] or (8 if template_type == "A" else 11)
 
         all_results = []
 
         for pdf_idx, pdf_file in enumerate(pdf_files):
-            current_amount_col = 4 + pdf_idx  # D=4, E=5, F=6, ...
+            current_amount_col = first_amount_col + pdf_idx  # A형: D=4,E=5... / B형: F=6,G=7...
 
             # PDF 임시 저장
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -294,9 +298,9 @@ async def match_with_summary(
             except Exception:
                 pass
 
-            # Excel에서 특약명 읽기
+            # Excel에서 특약명 읽기 (A형: B열, B형: C열)
             excel_coverages = read_excel_coverages(
-                excel_path, sn, 2, current_amount_col, start_row
+                excel_path, sn, coverage_col, current_amount_col, start_row
             )
 
             # 매칭
@@ -306,7 +310,7 @@ async def match_with_summary(
             all_results.append({
                 "pdf_name": pdf_file.filename,
                 "pdf_index": pdf_idx,
-                "column_letter": chr(ord('D') + pdf_idx),
+                "column_letter": chr(ord('A') + first_amount_col - 1 + pdf_idx),
                 "insurer_code": insurer_code,
                 "insurer_name": insurer_display,
                 "product_name": product_name,
@@ -347,6 +351,7 @@ async def match_with_summary(
         return {
             "success": True,
             "customer_name": customer_name,
+            "template_type": template_type,
             "structure": structure,
             "total_pdfs": len(pdf_files),
             "results": all_results,
@@ -388,15 +393,19 @@ async def match_and_download(
 
         sn = sheet_name if sheet_name else None
 
-        # 구조 자동 탐지
+        # 구조 자동 탐지 (A형/B형 자동 분기)
         structure = find_structure(output_path, sn, 2)
-        insurer_name_row = structure["insurer_row"] or 4
-        product_name_row = structure["product_row"] or 5
-        premium_row = structure["premium_row"] or 6
-        start_row = structure["start_row"] or 8
+        template_type = structure.get("template_type", "A")
+        coverage_col = structure.get("coverage_col", 2)
+        first_amount_col = structure.get("first_amount_col", 4)
+
+        insurer_name_row = structure["insurer_row"] or (4 if template_type == "A" else 5)
+        product_name_row = structure["product_row"] or (5 if template_type == "A" else 6)
+        premium_row = structure["premium_row"] or (6 if template_type == "A" else 9)
+        start_row = structure["start_row"] or (8 if template_type == "A" else 11)
 
         for pdf_idx, pdf_file in enumerate(pdf_files):
-            current_amount_col = 4 + pdf_idx
+            current_amount_col = first_amount_col + pdf_idx
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 content = await pdf_file.read()
@@ -436,9 +445,9 @@ async def match_and_download(
                     current_amount_col, sn
                 )
 
-            # 특약 추출 및 매칭
+            # 특약 추출 및 매칭 (A형: B열, B형: C열)
             excel_coverages = read_excel_coverages(
-                output_path, sn, 2, current_amount_col, start_row
+                output_path, sn, coverage_col, current_amount_col, start_row
             )
 
             result = match_coverages(pdf_coverages, excel_coverages, threshold)
