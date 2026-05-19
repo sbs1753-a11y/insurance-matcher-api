@@ -801,6 +801,56 @@ def get_aggregated_amounts(pdf_coverages):
                 result["자동차사고부상14등급"] = round(cov["가입금액"] / 30)
                 break
 
+    # 1인실 입원일당 (종합/상급) — 종합병원 + 상급종합병원 금액 결합
+    room_1_general = 0  # 종합병원 1인실
+    room_1_superior = 0  # 상급종합병원 1인실
+    for key, amount in simplified.items():
+        if "1인실" in key and "입원" in key:
+            if "상급종합병원" in key or "상급종합" in key:
+                room_1_superior += amount
+            elif "종합병원" in key:
+                room_1_general += amount
+    if room_1_general > 0 or room_1_superior > 0:
+        gen_man = room_1_general // 10000
+        sup_man = room_1_superior // 10000
+        parts = []
+        if gen_man > 0:
+            parts.append(f"종합{gen_man}")
+        if sup_man > 0:
+            parts.append(f"상급{sup_man}")
+        result["1인실입원일당(종합/상급)"] = {
+            "amount": room_1_general + room_1_superior,
+            "display": " ".join(parts)
+        }
+
+    # 다인실 입원일당 (종합/상급) — 2-3인실 기준 (4-5인실 제외)
+    # PDF에서 "2-3인실입원특약(상급종합병원)" + "2-3인실입원특약(종합병원)" 결합
+    room_multi_general = 0  # 종합병원 다인실
+    room_multi_superior = 0  # 상급종합병원 다인실
+    for key, amount in simplified.items():
+        if ("2-3인실" in key or "2,3인실" in key or "다인실" in key) and "입원" in key:
+            if "4-5인실" in key or "4,5인실" in key:
+                continue  # 4-5인실은 제외
+            if "상급종합병원" in key or "상급종합" in key:
+                room_multi_superior += amount
+            elif "종합병원" in key:
+                room_multi_general += amount
+            elif "상급종합병원" not in key and "종합병원" not in key:
+                # 병원 구분 없는 경우 (예: 상급병실차액)
+                room_multi_general += amount
+    if room_multi_general > 0 or room_multi_superior > 0:
+        gen_man = room_multi_general // 10000
+        sup_man = room_multi_superior // 10000
+        parts = []
+        if gen_man > 0:
+            parts.append(f"종합{gen_man}")
+        if sup_man > 0:
+            parts.append(f"상급{sup_man}")
+        result["다인실입원일당(종합/상급)"] = {
+            "amount": room_multi_general + room_multi_superior,
+            "display": " ".join(parts)
+        }
+
     return result
 
 
@@ -987,14 +1037,9 @@ MATCHING_RULES = {
         "응급실내원비(응급)",  # 메리츠: 응급실내원비(응급)
     ]},
     "응급실내원(비응급)": {"type": "direct", "keywords": ["응급실내원(비응급)"]},
-    # B형 신규: 1인실/다인실 입원일당
-    "1인실입원일당(종합/상급)": {"type": "direct", "keywords": [
-        "1인실입원일당", "상급종합병원1인실", "종합병원1인실",
-    ]},
-    "다인실입원일당(종합/상급)": {"type": "direct", "keywords": [
-        "다인실입원일당", "2-3인실입원일당", "2,3인실입원일당",
-        "상급병실차액", "상급병실",
-    ]},
+    # B형 신규: 1인실/다인실 입원일당 (종합+상급 결합 표시)
+    "1인실입원일당(종합/상급)": {"type": "aggregate", "key": "1인실입원일당(종합/상급)"},
+    "다인실입원일당(종합/상급)": {"type": "aggregate", "key": "다인실입원일당(종합/상급)"},
     # B형 신규: 간병인/간호간병
     "간병인지원(사람)/사용(현금)": {"type": "direct", "keywords": [
         "간병인사용일당", "간병인지원일당", "간병인",
@@ -1104,6 +1149,7 @@ def match_coverages(pdf_coverages, excel_coverages, threshold=70):
 
         matched_amount = None
         matched_pdf_name = ""
+        display_amount = None  # 복합 금액 표시용 (예: "종합12 상급30")
 
         if isinstance(rule, dict):
             rule_type = rule["type"]
@@ -1111,8 +1157,15 @@ def match_coverages(pdf_coverages, excel_coverages, threshold=70):
             if rule_type == "aggregate":
                 key = rule["key"]
                 if key in aggregated:
-                    matched_amount = aggregated[key]
-                    matched_pdf_name = f"[합산] {key}"
+                    agg_val = aggregated[key]
+                    # 1인실/다인실 등 복합 금액: dict {"amount": int, "display": str}
+                    if isinstance(agg_val, dict):
+                        matched_amount = agg_val["amount"]
+                        matched_pdf_name = f"[결합] {key}"
+                        display_amount = agg_val["display"]
+                    else:
+                        matched_amount = agg_val
+                        matched_pdf_name = f"[합산] {key}"
 
             elif rule_type == "special_general_death":
                 # 일반사망: aggregated에서 찾기
@@ -1165,14 +1218,17 @@ def match_coverages(pdf_coverages, excel_coverages, threshold=70):
                         break
 
         if matched_amount is not None:
-            results.append({
+            item = {
                 "excel_row": excel_item["row"],
                 "excel_특약명": excel_item["특약명"],
                 "pdf_특약명": matched_pdf_name,
                 "가입금액": matched_amount,
                 "유사도": 100.0,
                 "amount_col": excel_item["amount_col"]
-            })
+            }
+            if display_amount:
+                item["display_amount"] = display_amount
+            results.append(item)
         else:
             unmatched_excel.append(excel_item)
 

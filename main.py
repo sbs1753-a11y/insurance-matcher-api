@@ -331,6 +331,7 @@ async def match_with_summary(
                         "가입금액": m["가입금액"],
                         "가입금액_만원": m["가입금액"] // 10000,
                         "유사도": m["유사도"],
+                        **({"display_amount": m["display_amount"]} if "display_amount" in m else {}),
                     }
                     for m in matched
                 ],
@@ -458,7 +459,8 @@ async def match_and_download(
                 write_data = [{
                     "row": m["excel_row"],
                     "amount_col": m["amount_col"],
-                    "가입금액": m["가입금액"] // 10000
+                    "가입금액": m["가입금액"] // 10000,
+                    **({"display_amount": m["display_amount"]} if "display_amount" in m else {}),
                 } for m in matched]
                 write_matched_amounts(output_path, output_path, write_data, sn)
 

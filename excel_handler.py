@@ -178,11 +178,19 @@ def write_matched_amounts(excel_path, output_path, matched_data, sheet_name=None
         ws = wb[sheet_name] if sheet_name else wb.active
 
         for item in matched_data:
-            ws.cell(
-                row=item["row"],
-                column=item["amount_col"],
-                value=item["가입금액"]
-            )
+            # display_amount가 있으면 문자열로 기록 (예: "종합12 상급30")
+            if "display_amount" in item and item["display_amount"]:
+                ws.cell(
+                    row=item["row"],
+                    column=item["amount_col"],
+                    value=item["display_amount"]
+                )
+            else:
+                ws.cell(
+                    row=item["row"],
+                    column=item["amount_col"],
+                    value=item["가입금액"]
+                )
 
         wb.save(output_path)
     finally:
