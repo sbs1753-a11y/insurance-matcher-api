@@ -109,13 +109,15 @@ def write_cells_zip(file_path, cell_updates):
     if missing:
         ws_xml = _insert_new_cells(ws_xml, missing)
 
-    # ── 5. ZIP에서 워크시트 XML만 교체 ──────────────────────────
+    # ── 5. ZIP에서 워크시트 XML만 교체 (calcChain은 제거해 수식 재계산 강제) ──
     tmp = file_path + ".tmp"
     with zipfile.ZipFile(file_path, "r") as zf_in, \
          zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf_out:
         for info in zf_in.infolist():
             if info.filename == ws_path:
                 zf_out.writestr(info, ws_xml.encode("utf-8"))
+            elif info.filename == "xl/calcChain.xml":
+                pass  # 제거: 파일 열 때 Excel이 수식 전체 재계산
             else:
                 zf_out.writestr(info, zf_in.read(info.filename))
 
