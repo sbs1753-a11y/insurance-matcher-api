@@ -122,7 +122,8 @@ def write_cells_zip(file_path, cell_updates):
     if missing:
         ws_xml = _insert_new_cells(ws_xml, missing)
 
-    # ── 5. ZIP에서 워크시트 XML만 교체 (calcChain은 제거해 수식 재계산 강제) ──
+    # ── 5. ZIP에서 워크시트 XML만 교체 ──────────────────────────────────────
+    # calcChain 제거 + workbook.xml에 fullCalcOnLoad="1" 추가로 파일 열 때 수식 강제 재계산
     tmp = file_path + ".tmp"
     with zipfile.ZipFile(file_path, "r") as zf_in, \
          zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf_out:
@@ -130,7 +131,21 @@ def write_cells_zip(file_path, cell_updates):
             if info.filename == ws_path:
                 zf_out.writestr(info, ws_xml.encode("utf-8"))
             elif info.filename == "xl/calcChain.xml":
-                pass  # 제거: 파일 열 때 Excel이 수식 전체 재계산
+                pass  # 제거: Excel이 전체 수식 재계산하도록 강제
+            elif info.filename == "xl/workbook.xml":
+                wb_xml = zf_in.read(info.filename).decode("utf-8")
+                # calcPr에 fullCalcOnLoad="1" 추가 (없으면 삽입)
+                if "calcPr" in wb_xml:
+                    wb_xml = re.sub(
+                        r'<calcPr\b([^/]*)/>',
+                        lambda m: f'<calcPr{m.group(1)} fullCalcOnLoad="1"/>'
+                        if "fullCalcOnLoad" not in m.group(1)
+                        else m.group(0),
+                        wb_xml,
+                    )
+                else:
+                    wb_xml = wb_xml.replace("</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>')
+                zf_out.writestr(info, wb_xml.encode("utf-8"))
             else:
                 zf_out.writestr(info, zf_in.read(info.filename))
 
