@@ -122,6 +122,15 @@ def write_cells_zip(file_path, cell_updates):
     if missing:
         ws_xml = _insert_new_cells(ws_xml, missing)
 
+    # ── 4.5 수식 셀 캐시 제거 → Excel이 반드시 재계산 ──────────────────────
+    # <f>가 있는 셀의 <v>캐시값</v>을 제거해 Excel이 강제로 계산하게 함
+    ws_xml = re.sub(
+        r'(<f\b[^>]*(?:>.*?</f>|/>))\s*<v>[^<]*</v>',
+        r'\1',
+        ws_xml,
+        flags=re.DOTALL,
+    )
+
     # ── 5. ZIP에서 워크시트 XML만 교체 ──────────────────────────────────────
     # calcChain 제거 + workbook.xml에 fullCalcOnLoad="1" 추가로 파일 열 때 수식 강제 재계산
     tmp = file_path + ".tmp"
