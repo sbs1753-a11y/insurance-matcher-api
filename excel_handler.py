@@ -78,15 +78,15 @@ def write_cells_zip(file_path, cell_updates):
         attrs = re.sub(r'\s*t="[^"]*"', "", attrs)
         return f'<c r="{addr}"{attrs} t="str">{inner}<v>{escaped}</v></c>'
 
-    # 닫힌 태그 형태: <c r="A1" ...>...</c>
+    # 닫힌 태그 형태: <c r="A1" ...>...</c>  (자기닫힘 제외: [^/>]* 로 / 차단)
     ws_xml = re.sub(
-        r'<c r="([A-Z]+\d+)"([^>]*)>(.*?)</c>',
+        r'<c r="([A-Z]+\d+)"([^/>]*)>(.*?)</c>',
         replace_cell,
         ws_xml,
         flags=re.DOTALL,
     )
 
-    # 자기 닫힘 형태: <c r="A1" ... />  → 값 있는 셀로 확장
+    # 자기 닫힘 형태만: <c r="A1" ... />  (여는 태그 > 는 매칭 안 함)
     def replace_selfclose(m):
         addr  = m.group(1)
         attrs = m.group(2)
@@ -99,7 +99,7 @@ def write_cells_zip(file_path, cell_updates):
         return f'<c r="{addr}"{attrs} t="str"><v>{escaped}</v></c>'
 
     ws_xml = re.sub(
-        r'<c r="([A-Z]+\d+)"([^/>]*)/?>',
+        r'<c r="([A-Z]+\d+)"([^/>]*)/>',
         replace_selfclose,
         ws_xml,
     )
