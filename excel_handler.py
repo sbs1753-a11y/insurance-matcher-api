@@ -27,6 +27,14 @@ def _escape_xml(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _is_numeric(s):
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def write_cells_zip(file_path, cell_updates):
     """
     xlsx 파일을 ZIP으로 직접 조작해 셀 값만 수정.
@@ -70,13 +78,16 @@ def write_cells_zip(file_path, cell_updates):
         val = updates[addr]
         processed.add(addr)
 
-        escaped = _escape_xml(val)
-        # 기존 <v>/<f> 제거
+        # 기존 <v>/<f>/<is> 제거
         inner = re.sub(r"<v>[^<]*</v>", "", inner)
         inner = re.sub(r"<f[^>]*>.*?</f>", "", inner, flags=re.DOTALL)
-        # t 속성 → "str" (인라인 문자열)
+        inner = re.sub(r"<is>.*?</is>", "", inner, flags=re.DOTALL)
         attrs = re.sub(r'\s*t="[^"]*"', "", attrs)
-        return f'<c r="{addr}"{attrs} t="str">{inner}<v>{escaped}</v></c>'
+        if _is_numeric(val):
+            # 숫자값: t 속성 없이 숫자 셀로 저장 → 셀 서식 (#,##0"만원" 등) 적용됨
+            return f'<c r="{addr}"{attrs}>{inner}<v>{val}</v></c>'
+        else:
+            return f'<c r="{addr}"{attrs} t="str">{inner}<v>{_escape_xml(val)}</v></c>'
 
     # 닫힌 태그 형태: <c r="A1" ...>...</c>  (자기닫힘 제외: [^/>]* 로 / 차단)
     ws_xml = re.sub(
@@ -94,9 +105,11 @@ def write_cells_zip(file_path, cell_updates):
             return m.group(0)
         val = updates[addr]
         processed.add(addr)
-        escaped = _escape_xml(val)
         attrs = re.sub(r'\s*t="[^"]*"', "", attrs)
-        return f'<c r="{addr}"{attrs} t="str"><v>{escaped}</v></c>'
+        if _is_numeric(val):
+            return f'<c r="{addr}"{attrs}><v>{val}</v></c>'
+        else:
+            return f'<c r="{addr}"{attrs} t="str"><v>{_escape_xml(val)}</v></c>'
 
     ws_xml = re.sub(
         r'<c r="([A-Z]+\d+)"([^/>]*)/>',
